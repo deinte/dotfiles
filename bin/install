@@ -64,6 +64,10 @@ info "Installing Homebrew packages from Brewfile..."
 brew bundle --file="$DOTFILES/config/Brewfile" || warn "Some packages failed to install"
 success "Homebrew packages installed"
 
+# Reload PATH to pick up newly installed Homebrew packages
+eval "$(/opt/homebrew/bin/brew shellenv)"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.composer/vendor/bin:$PATH"
+
 # ─────────────────────────────────────────────────────────────────────
 # Oh My Zsh
 # ─────────────────────────────────────────────────────────────────────
