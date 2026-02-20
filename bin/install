@@ -1,266 +1,176 @@
 #!/bin/bash
+#
+# Install dotfiles
 
-set -e
+set -e  # Exit on error (but we use || true for optional steps)
 
-DOTFILES="$HOME/.dotfiles"
-
-# Colors for output
-RED='\033[0;31m'
+# Colors
+BLUE='\033[0;34m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+RED='\033[0;31m'
+NC='\033[0m'
 
-info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-success() { echo -e "${GREEN}[OK]${NC} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1"; }
-
-# Check if running from correct location
-if [ ! -d "$DOTFILES" ]; then
-    error "Dotfiles not found at $DOTFILES"
-    error "Please clone to ~/.dotfiles first:"
-    echo "  git clone git@github.com:deinte/dotfiles.git ~/.dotfiles"
-    exit 1
-fi
-
-cd "$DOTFILES"
+step() { echo ""; echo -e "${BLUE}➜${NC} $1"; }
+success() { echo -e "${GREEN}✓${NC} $1"; }
+warn() { echo -e "${YELLOW}⚠${NC} $1"; }
+error() { echo -e "${RED}✗${NC} $1"; exit 1; }
 
 echo ""
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║                    Dotfiles Installation                      ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
+step "Install Dotfiles"
+echo ""
+warn "This will install/update your development environment"
+echo ""
+read -p "Continue? (y/n) " -n 1 -r
 echo ""
 
-# ─────────────────────────────────────────────────────────────────────
-# Xcode Command Line Tools
-# ─────────────────────────────────────────────────────────────────────
-info "Checking Xcode Command Line Tools..."
-if ! xcode-select -p &>/dev/null; then
-    info "Installing Xcode Command Line Tools..."
-    xcode-select --install
-    echo "Press any key when installation is complete..."
-    read -n 1
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo ""
+    step "Cancelled"
+    echo ""
+    exit 0
 fi
-success "Xcode Command Line Tools installed"
 
-# ─────────────────────────────────────────────────────────────────────
-# Homebrew
-# ─────────────────────────────────────────────────────────────────────
-info "Checking Homebrew..."
-if ! command -v brew &>/dev/null; then
-    info "Installing Homebrew..."
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+echo ""
+sudo -v
 
-    # Add Homebrew to PATH for Apple Silicon
-    if [[ $(uname -m) == "arm64" ]]; then
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-    fi
-fi
-success "Homebrew installed"
+# Keep sudo alive
+while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
 
-# Install all packages from Brewfile
-info "Installing Homebrew packages from Brewfile..."
-brew bundle --file="$DOTFILES/config/Brewfile" || warn "Some packages failed to install"
-success "Homebrew packages installed"
-
-# Ensure critical CLI tools are installed (fallback if Brewfile had issues)
-info "Verifying critical packages..."
-for pkg in fnm php composer; do
-    if ! brew list $pkg &>/dev/null; then
-        info "Installing $pkg..."
-        brew install $pkg
-    fi
-done
-
-# Reload PATH to pick up newly installed Homebrew packages
-if [[ $(uname -m) == "arm64" ]]; then
-    eval "$(/opt/homebrew/bin/brew shellenv)"
-    export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.composer/vendor/bin:$PATH"
-else
-    eval "$(/usr/local/bin/brew shellenv)"
-    export PATH="/usr/local/bin:/usr/local/sbin:$HOME/.composer/vendor/bin:$PATH"
-fi
+# Suppress login message
+touch ~/.hushlogin
 
 # ─────────────────────────────────────────────────────────────────────
 # Oh My Zsh
 # ─────────────────────────────────────────────────────────────────────
-info "Checking Oh My Zsh..."
-if [ ! -d "$HOME/.oh-my-zsh" ]; then
-    info "Installing Oh My Zsh..."
-    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+step "Installing Oh My Zsh"
+if [ ! -d ~/.oh-my-zsh ]; then
+    curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh | sh -s -- --unattended || warn "Oh My Zsh installation failed"
 fi
 success "Oh My Zsh installed"
 
 # ─────────────────────────────────────────────────────────────────────
-# Symlink Home Files
+# Homebrew
 # ─────────────────────────────────────────────────────────────────────
-info "Creating symlinks for home files..."
+step "Installing Homebrew"
+if ! command -v brew &>/dev/null; then
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+fi
 
-link_file() {
-    local src="$1"
-    local dest="$2"
+# Add Homebrew to PATH (Apple Silicon or Intel)
+if [[ $(uname -m) == "arm64" ]]; then
+    echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+else
+    eval "$(/usr/local/bin/brew shellenv)"
+fi
+success "Homebrew installed"
 
-    if [ -L "$dest" ]; then
-        rm "$dest"
-    elif [ -f "$dest" ]; then
-        mv "$dest" "$dest.backup"
-        warn "Backed up existing $dest to $dest.backup"
-    fi
+# ─────────────────────────────────────────────────────────────────────
+# Brewfile packages
+# ─────────────────────────────────────────────────────────────────────
+step "Installing packages from Brewfile"
+brew bundle --file=~/.dotfiles/config/Brewfile || warn "Some packages failed (likely already installed)"
+success "Brewfile processed"
 
-    ln -s "$src" "$dest"
-    success "Linked $(basename $dest)"
-}
+# ─────────────────────────────────────────────────────────────────────
+# Git configuration
+# ─────────────────────────────────────────────────────────────────────
+step "Configuring Git"
+ln -sf ~/.dotfiles/home/.gitconfig ~/.gitconfig
+ln -sf ~/.dotfiles/home/.global-gitignore ~/.global-gitignore
+success "Git configured"
 
-link_dir() {
-    local src="$1"
-    local dest="$2"
+# ─────────────────────────────────────────────────────────────────────
+# Symlinks
+# ─────────────────────────────────────────────────────────────────────
+step "Creating symlinks"
+rm -f ~/.zshrc ~/.vimrc ~/.aliases ~/.functions ~/.exports
+ln -sf ~/.dotfiles/home/.zshrc ~/.zshrc
+ln -sf ~/.dotfiles/home/.vimrc ~/.vimrc
+ln -sf ~/.dotfiles/home/.aliases ~/.aliases
+ln -sf ~/.dotfiles/home/.functions ~/.functions
+ln -sf ~/.dotfiles/home/.exports ~/.exports
 
-    if [ -L "$dest" ]; then
-        rm "$dest"
-    elif [ -d "$dest" ]; then
-        mv "$dest" "$dest.backup"
-        warn "Backed up existing $dest to $dest.backup"
-    fi
+# Starship config
+mkdir -p ~/.config
+ln -sf ~/.dotfiles/config/starship.toml ~/.config/starship.toml
 
-    ln -s "$src" "$dest"
-    success "Linked $(basename $dest)/"
-}
+# Zed editor config
+mkdir -p ~/.config/zed
+ln -sf ~/.dotfiles/config/zed/settings.json ~/.config/zed/settings.json
+ln -sf ~/.dotfiles/config/zed/keymap.json ~/.config/zed/keymap.json
 
-# Link all files from home/ to ~/
-for file in "$DOTFILES/home/".*; do
-    if [ -f "$file" ]; then
-        filename=$(basename "$file")
-        link_file "$file" "$HOME/$filename"
+# Dotfiles bin
+mkdir -p ~/bin
+ln -sf ~/.dotfiles/bin/php-format ~/bin/php-format
+success "Symlinks created"
+
+# ─────────────────────────────────────────────────────────────────────
+# Claude Code config
+# ─────────────────────────────────────────────────────────────────────
+step "Setting up Claude Code config"
+mkdir -p ~/.claude
+for dir in agents skills commands hooks plugins get-shit-done; do
+    if [ -d ~/.dotfiles/config/claude/$dir ]; then
+        rm -rf ~/.claude/$dir
+        ln -sf ~/.dotfiles/config/claude/$dir ~/.claude/$dir
     fi
 done
-
-# ─────────────────────────────────────────────────────────────────────
-# Starship Config
-# ─────────────────────────────────────────────────────────────────────
-info "Setting up Starship prompt..."
-mkdir -p "$HOME/.config"
-link_file "$DOTFILES/config/starship.toml" "$HOME/.config/starship.toml"
-
-# ─────────────────────────────────────────────────────────────────────
-# Zed Editor Config
-# ─────────────────────────────────────────────────────────────────────
-info "Setting up Zed editor config..."
-ZED_CONFIG="$HOME/.config/zed"
-mkdir -p "$ZED_CONFIG"
-link_file "$DOTFILES/config/zed/settings.json" "$ZED_CONFIG/settings.json"
-link_file "$DOTFILES/config/zed/keymap.json" "$ZED_CONFIG/keymap.json"
-
-# ─────────────────────────────────────────────────────────────────────
-# Claude Code Config (skills, agents, settings)
-# ─────────────────────────────────────────────────────────────────────
-info "Setting up Claude Code config..."
-CLAUDE_CONFIG="$HOME/.claude"
-CLAUDE_DOTFILES="$DOTFILES/config/claude"
-
-# Create Claude config directory if it doesn't exist
-mkdir -p "$CLAUDE_CONFIG"
-
-# Link specific config directories (not the whole folder, so Claude can write runtime data)
-CLAUDE_DIRS=(agents skills commands hooks plugins get-shit-done)
-for dir in "${CLAUDE_DIRS[@]}"; do
-    if [ -d "$CLAUDE_DOTFILES/$dir" ]; then
-        link_dir "$CLAUDE_DOTFILES/$dir" "$CLAUDE_CONFIG/$dir"
-    fi
-done
-
-# Link settings.json
-if [ -f "$CLAUDE_DOTFILES/settings.json" ]; then
-    link_file "$CLAUDE_DOTFILES/settings.json" "$CLAUDE_CONFIG/settings.json"
+if [ -f ~/.dotfiles/config/claude/settings.json ]; then
+    ln -sf ~/.dotfiles/config/claude/settings.json ~/.claude/settings.json
 fi
-
-success "Claude Code config linked (skills, agents, settings)"
-
-# ─────────────────────────────────────────────────────────────────────
-# FNM (Fast Node Manager)
-# ─────────────────────────────────────────────────────────────────────
-info "Setting up FNM..."
-if command -v fnm &>/dev/null; then
-    # Install latest LTS Node
-    fnm install --lts
-    fnm default lts-latest
-    success "Node LTS installed via FNM"
-else
-    warn "FNM not found, skipping Node setup"
-fi
+success "Claude Code configured"
 
 # ─────────────────────────────────────────────────────────────────────
-# PHP Extensions
+# FNM (Node.js)
 # ─────────────────────────────────────────────────────────────────────
-info "Installing PHP extensions..."
-if command -v pecl &>/dev/null; then
-    # Try to install common extensions (may fail if already installed)
-    pecl install imagick 2>/dev/null || true
-    pecl install redis 2>/dev/null || true
-    pecl install xdebug 2>/dev/null || true
-    success "PHP extensions installed (or already present)"
-else
-    warn "PECL not found, skipping PHP extensions"
-fi
+step "Setting up fnm"
+eval "$(fnm env --use-on-cd)" || warn "fnm activation failed"
+fnm install --lts || warn "fnm install failed"
+fnm use lts-latest || warn "fnm use failed"
+success "fnm configured"
 
 # ─────────────────────────────────────────────────────────────────────
-# Global Composer Packages
+# PHP extensions
 # ─────────────────────────────────────────────────────────────────────
-info "Installing global Composer packages..."
-if command -v composer &>/dev/null; then
-    composer global require laravel/pint laravel/envoy laravel/valet --quiet
-    success "Global Composer packages installed"
-else
-    warn "Composer not found, skipping global packages"
-fi
+step "Installing PHP extensions"
+pecl install imagick 2>/dev/null || warn "imagick already installed or failed"
+pecl install redis 2>/dev/null || warn "redis already installed or failed"
+pecl install xdebug 2>/dev/null || warn "xdebug already installed or failed"
+success "PHP extensions processed"
+
+# ─────────────────────────────────────────────────────────────────────
+# Global Composer packages
+# ─────────────────────────────────────────────────────────────────────
+step "Installing global Composer packages"
+composer global require laravel/pint || warn "pint already installed or failed"
+composer global require laravel/envoy || warn "envoy already installed or failed"
+composer global require laravel/valet || warn "valet already installed or failed"
+success "Composer packages processed"
 
 # ─────────────────────────────────────────────────────────────────────
 # Laravel Valet
 # ─────────────────────────────────────────────────────────────────────
-info "Setting up Laravel Valet..."
-if command -v valet &>/dev/null; then
-    valet install
-    success "Laravel Valet installed"
-else
-    # Try via composer global bin
-    COMPOSER_BIN="$HOME/.composer/vendor/bin"
-    if [ -x "$COMPOSER_BIN/valet" ]; then
-        "$COMPOSER_BIN/valet" install
-        success "Laravel Valet installed"
-    else
-        warn "Valet not found, please install manually"
-    fi
-fi
+step "Installing Laravel Valet"
+valet install || warn "Valet already installed or failed"
+success "Valet processed"
 
 # ─────────────────────────────────────────────────────────────────────
-# FZF Key Bindings
+# FZF
 # ─────────────────────────────────────────────────────────────────────
-info "Setting up FZF..."
-if command -v fzf &>/dev/null; then
-    # Source fzf key bindings (Homebrew location)
-    FZF_PREFIX="$(brew --prefix fzf 2>/dev/null)"
-    if [ -n "$FZF_PREFIX" ] && [ -f "$FZF_PREFIX/install" ]; then
-        "$FZF_PREFIX/install" --key-bindings --completion --no-update-rc --no-bash --no-fish
-    fi
-    success "FZF configured"
-fi
+step "Setting up FZF"
+$(brew --prefix)/opt/fzf/install --key-bindings --completion --no-update-rc --no-bash --no-fish 2>/dev/null || warn "FZF setup skipped"
+success "FZF processed"
 
 # ─────────────────────────────────────────────────────────────────────
-# Make scripts executable
-# ─────────────────────────────────────────────────────────────────────
-chmod +x "$DOTFILES/bin/"*
-chmod +x "$DOTFILES/macos/"*.sh 2>/dev/null || true
-
-# ─────────────────────────────────────────────────────────────────────
-# Done!
+# Done
 # ─────────────────────────────────────────────────────────────────────
 echo ""
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║                    Installation Complete!                     ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
+success "Installation complete!"
 echo ""
-success "All done! Please restart your terminal or run: exec zsh"
-echo ""
-info "Optional: Run macOS defaults with:"
-echo "  ~/.dotfiles/macos/set-defaults.sh"
+step "Next steps:"
+echo "  • Restart terminal: exec zsh"
+echo "  • (Optional) Apply macOS defaults: ~/.dotfiles/macos/set-defaults.sh"
+echo "  • Set Warp/terminal font to 'MesloLGS Nerd Font'"
 echo ""
