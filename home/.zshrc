@@ -1,6 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────
 # Oh My Zsh Configuration
 # ─────────────────────────────────────────────────────────────────────
+# Disable compinit insecure directories warning
+ZSH_DISABLE_COMPFIX=true
+
 export ZSH="$HOME/.oh-my-zsh"
 
 # Theme (disabled - using Starship instead)

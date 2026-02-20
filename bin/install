@@ -64,9 +64,23 @@ info "Installing Homebrew packages from Brewfile..."
 brew bundle --file="$DOTFILES/config/Brewfile" || warn "Some packages failed to install"
 success "Homebrew packages installed"
 
+# Ensure critical CLI tools are installed (fallback if Brewfile had issues)
+info "Verifying critical packages..."
+for pkg in fnm php composer; do
+    if ! brew list $pkg &>/dev/null; then
+        info "Installing $pkg..."
+        brew install $pkg
+    fi
+done
+
 # Reload PATH to pick up newly installed Homebrew packages
-eval "$(/opt/homebrew/bin/brew shellenv)"
-export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.composer/vendor/bin:$PATH"
+if [[ $(uname -m) == "arm64" ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+    export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.composer/vendor/bin:$PATH"
+else
+    eval "$(/usr/local/bin/brew shellenv)"
+    export PATH="/usr/local/bin:/usr/local/sbin:$HOME/.composer/vendor/bin:$PATH"
+fi
 
 # ─────────────────────────────────────────────────────────────────────
 # Oh My Zsh
