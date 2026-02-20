@@ -67,6 +67,8 @@ cask "ray"             # Laravel Ray debugger
 # Productivity
 cask "raycast"         # Spotlight replacement
 cask "claude-code"     # Claude AI assistant
+cask "1password"       # Password manager
+cask "1password-cli"   # 1Password CLI (for SSH keys)
 
 # ─────────────────────────────────────────────────────────────────────
 # Fonts
