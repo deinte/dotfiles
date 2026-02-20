@@ -70,7 +70,7 @@ success "Homebrew installed"
 # Brewfile packages
 # ─────────────────────────────────────────────────────────────────────
 step "Installing packages from Brewfile"
-brew bundle --file=~/.dotfiles/config/Brewfile || warn "Some packages failed (likely already installed)"
+brew bundle --file=~/.dotfiles/config/Brewfile --verbose || warn "Some packages failed (likely already installed)"
 success "Brewfile processed"
 
 # ─────────────────────────────────────────────────────────────────────
