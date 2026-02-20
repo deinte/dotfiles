@@ -64,6 +64,10 @@ cask "dbngin"          # Database server manager
 cask "tableplus"       # Database GUI
 cask "ray"             # Laravel Ray debugger
 
+# Browsers
+cask "vivaldi"         # Power-user browser
+cask "google-chrome"   # For testing/DevTools
+
 # Productivity
 cask "raycast"         # Spotlight replacement
 cask "claude-code"     # Claude AI assistant
