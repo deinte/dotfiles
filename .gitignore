@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Claude Code - credentials and runtime data (NEVER commit)
+config/claude/.credentials.json
+config/claude/cache/
+config/claude/debug/
+config/claude/file-history/
+config/claude/history.jsonl
+config/claude/paste-cache/
+config/claude/plans/
+config/claude/session-env/
+config/claude/shell-snapshots/
+config/claude/stats-cache.json
+config/claude/statsig/
+config/claude/tasks/
+config/claude/telemetry/
+config/claude/todos/
+config/claude/ide/
+config/claude/projects/
+
+# Local overrides (not committed)
+home/.zshrc.local

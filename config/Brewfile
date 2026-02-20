@@ -1,0 +1,82 @@
+# Dotfiles Brewfile
+# Install with: brew bundle --file=~/.dotfiles/config/Brewfile
+
+# ─────────────────────────────────────────────────────────────────────
+# Taps (must be first)
+# ─────────────────────────────────────────────────────────────────────
+tap "nicoverbruggen/homebrew-cask"  # For PHP Monitor
+
+# ─────────────────────────────────────────────────────────────────────
+# CLI Tools
+# ─────────────────────────────────────────────────────────────────────
+
+# Git & GitHub
+brew "gh"
+brew "hub"
+brew "git-secret"
+brew "git-delta"       # Better diffs
+
+# PHP Development
+brew "php"
+brew "composer"
+
+# Media processing
+brew "imagemagick"
+brew "ghostscript"
+
+# Modern CLI replacements
+brew "zoxide"          # Smart cd (replaces z)
+brew "bat"             # Better cat
+brew "eza"             # Better ls
+brew "fd"              # Better find
+brew "ripgrep"         # Better grep
+brew "fzf"             # Fuzzy finder
+brew "bottom"          # Better htop
+
+# Shell & Prompt
+brew "starship"        # Modern prompt
+brew "zsh-autosuggestions"
+brew "zsh-completions"
+
+# Node.js
+brew "fnm"             # Fast Node Manager (replaces nvm)
+
+# Utilities
+brew "httpie"          # Better curl
+brew "wget"
+brew "ncdu"            # Disk usage analyzer
+brew "jq"              # JSON processor
+brew "yq"              # YAML processor
+brew "direnv"          # Per-project env vars
+
+# ─────────────────────────────────────────────────────────────────────
+# GUI Applications
+# ─────────────────────────────────────────────────────────────────────
+
+# Development
+cask "warp"            # Modern terminal
+cask "zed"             # Fast code editor
+cask "jetbrains-toolbox"
+
+# PHP/Laravel Tools
+cask "phpmon"          # PHP version manager UI
+cask "dbngin"          # Database server manager
+cask "tableplus"       # Database GUI
+cask "ray"             # Laravel Ray debugger
+
+# Productivity
+cask "raycast"         # Spotlight replacement
+cask "claude-code"     # Claude AI assistant
+
+# ─────────────────────────────────────────────────────────────────────
+# Fonts
+# ─────────────────────────────────────────────────────────────────────
+cask "font-meslo-lg-nerd-font"
+
+# ─────────────────────────────────────────────────────────────────────
+# QuickLook Plugins
+# ─────────────────────────────────────────────────────────────────────
+cask "qlcolorcode"     # Syntax highlighting
+cask "qlstephen"       # Plain text files
+cask "qlmarkdown"      # Markdown preview
+cask "quicklook-json"  # JSON preview

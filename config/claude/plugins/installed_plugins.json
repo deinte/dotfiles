@@ -1,0 +1,44 @@
+{
+  "version": 2,
+  "plugins": {
+    "codebase-cleanup@claude-code-workflows": [
+      {
+        "scope": "user",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-code-workflows/codebase-cleanup/unknown",
+        "version": "unknown",
+        "installedAt": "2025-11-12T14:36:45.750Z",
+        "lastUpdated": "2025-11-12T14:36:45.750Z",
+        "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831"
+      }
+    ],
+    "documentation-generation@claude-code-workflows": [
+      {
+        "scope": "user",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-code-workflows/documentation-generation/unknown",
+        "version": "unknown",
+        "installedAt": "2025-11-12T21:03:47.297Z",
+        "lastUpdated": "2025-11-12T21:03:47.297Z",
+        "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831"
+      }
+    ],
+    "frontend-design@claude-plugins-official": [
+      {
+        "scope": "user",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-plugins-official/frontend-design/e30768372b41",
+        "version": "e30768372b41",
+        "installedAt": "2026-01-10T11:11:41.564Z",
+        "lastUpdated": "2026-01-23T09:33:10.398Z"
+      }
+    ],
+    "filament-specialist@mwguerra-marketplace": [
+      {
+        "scope": "user",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/mwguerra-marketplace/filament-specialist/1.0.0",
+        "version": "1.0.0",
+        "installedAt": "2026-01-18T12:36:35.803Z",
+        "lastUpdated": "2026-01-18T12:36:35.803Z",
+        "gitCommitSha": "966a4b800b0f75df265b996bbb7c5b237f554e13"
+      }
+    ]
+  }
+}

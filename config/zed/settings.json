@@ -1,0 +1,74 @@
+{
+  "theme": "One Dark",
+  "ui_font_size": 14,
+  "buffer_font_size": 13,
+  "buffer_font_family": "MesloLGS Nerd Font",
+  "tab_size": 4,
+  "soft_wrap": "editor_width",
+  "format_on_save": "on",
+  "autosave": {
+    "after_delay": {
+      "milliseconds": 1000
+    }
+  },
+  "git": {
+    "inline_blame": {
+      "enabled": true
+    }
+  },
+  "terminal": {
+    "font_family": "MesloLGS Nerd Font",
+    "font_size": 13,
+    "working_directory": "current_project_directory"
+  },
+  "file_types": {
+    "PHP": ["php", "blade.php"]
+  },
+  "language_overrides": {
+    "PHP": {
+      "tab_size": 4,
+      "format_on_save": "on",
+      "formatter": {
+        "external": {
+          "command": "~/.dotfiles/bin/php-format",
+          "arguments": ["{buffer_path}"]
+        }
+      }
+    },
+    "JavaScript": {
+      "tab_size": 2
+    },
+    "TypeScript": {
+      "tab_size": 2
+    },
+    "JSON": {
+      "tab_size": 2
+    },
+    "YAML": {
+      "tab_size": 2
+    },
+    "Blade": {
+      "tab_size": 4
+    }
+  },
+  "inlay_hints": {
+    "enabled": true
+  },
+  "project_panel": {
+    "dock": "left",
+    "default_width": 240
+  },
+  "outline_panel": {
+    "dock": "right"
+  },
+  "collaboration_panel": {
+    "dock": "right"
+  },
+  "notification_panel": {
+    "dock": "right"
+  },
+  "telemetry": {
+    "diagnostics": false,
+    "metrics": false
+  }
+}

@@ -1,0 +1,66 @@
+#!/bin/bash
+
+# PHP Formatter for Zed Editor
+# Formats PHP files using Laravel Pint (or falls back to php-cs-fixer)
+#
+# Usage: php-format <file>
+#
+# Configure in Zed settings.json:
+# "language_overrides": {
+#   "PHP": {
+#     "format_on_save": "on",
+#     "formatter": {
+#       "external": {
+#         "command": "~/.dotfiles/bin/php-format",
+#         "arguments": ["{buffer_path}"]
+#       }
+#     }
+#   }
+# }
+
+FILE="$1"
+
+if [ -z "$FILE" ]; then
+    echo "Usage: php-format <file>" >&2
+    exit 1
+fi
+
+# Find project root (look for composer.json)
+find_project_root() {
+    local dir="$1"
+    while [ "$dir" != "/" ]; do
+        if [ -f "$dir/composer.json" ]; then
+            echo "$dir"
+            return
+        fi
+        dir=$(dirname "$dir")
+    done
+    echo ""
+}
+
+PROJECT_ROOT=$(find_project_root "$(dirname "$FILE")")
+
+# Try project-local Pint first
+if [ -n "$PROJECT_ROOT" ] && [ -x "$PROJECT_ROOT/vendor/bin/pint" ]; then
+    "$PROJECT_ROOT/vendor/bin/pint" "$FILE" --quiet
+    cat "$FILE"
+    exit 0
+fi
+
+# Try global Pint
+if command -v pint &>/dev/null; then
+    pint "$FILE" --quiet
+    cat "$FILE"
+    exit 0
+fi
+
+# Try Composer global Pint
+COMPOSER_BIN="$HOME/.composer/vendor/bin"
+if [ -x "$COMPOSER_BIN/pint" ]; then
+    "$COMPOSER_BIN/pint" "$FILE" --quiet
+    cat "$FILE"
+    exit 0
+fi
+
+# Fallback: just output the file unchanged
+cat "$FILE"

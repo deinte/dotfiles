@@ -1,0 +1,41 @@
+[
+  {
+    "context": "Editor",
+    "bindings": {
+      "cmd-shift-d": "editor::DuplicateLine",
+      "cmd-shift-k": "editor::DeleteLine",
+      "cmd-/": "editor::ToggleComments",
+      "cmd-d": "editor::SelectNext",
+      "ctrl-g": "go_to_line::Toggle"
+    }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "cmd-k cmd-s": "zed::OpenKeymap",
+      "cmd-,": "zed::OpenSettings",
+      "cmd-shift-e": "project_panel::ToggleFocus",
+      "cmd-b": "workspace::ToggleLeftDock",
+      "cmd-shift-f": "pane::DeploySearch",
+      "cmd-shift-h": "workspace::NewSearch"
+    }
+  },
+  {
+    "context": "ProjectPanel",
+    "bindings": {
+      "a": "project_panel::NewFile",
+      "shift-a": "project_panel::NewDirectory",
+      "r": "project_panel::Rename",
+      "d": "project_panel::Delete",
+      "x": "project_panel::Cut",
+      "c": "project_panel::Copy",
+      "p": "project_panel::Paste"
+    }
+  },
+  {
+    "context": "Terminal",
+    "bindings": {
+      "cmd-k": "terminal::Clear"
+    }
+  }
+]

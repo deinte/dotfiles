@@ -1,0 +1,24 @@
+---
+description: Initialize a .taskmanager directory in the project if it does not exist
+allowed-tools: Read, Write, Glob
+---
+
+# Init Task Manager Command
+
+You are implementing `taskmanager:init`.
+
+## Behavior
+
+1. Check if `.taskmanager` exists:
+   - Use `Glob` or `Read` on `.taskmanager/tasks.json`.
+2. If `.taskmanager` already exists:
+   - Inform the user and do nothing unless they explicitly ask for a reset.
+3. If it does not exist:
+   - Copy the template structure from the plugin's `skills/taskmanager/template/.taskmanager/` directory.
+   - For each file in the template tree:
+     - Use `Read` to load the template.
+     - Use `Write` to create the corresponding file under `.taskmanager`.
+4. Summarize:
+   - Which files/directories were created.
+   - Note that `tasks-archive.json` is created for future archival of completed tasks.
+   - How to run `taskmanager:plan` next.

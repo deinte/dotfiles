@@ -1,0 +1,199 @@
+# ─────────────────────────────────────────────────────────────────────
+# PHP / Laravel Functions
+# ─────────────────────────────────────────────────────────────────────
+
+# Run Pest or PHPUnit (auto-detect)
+p() {
+    if [ -f vendor/bin/pest ]; then
+        vendor/bin/pest "$@"
+    elif [ -f vendor/bin/phpunit ]; then
+        vendor/bin/phpunit "$@"
+    else
+        echo "No test runner found (pest or phpunit)"
+        return 1
+    fi
+}
+
+# Run Laravel scheduler continuously
+scheduler() {
+    while true; do
+        php artisan schedule:run
+        sleep 60
+    done
+}
+
+# Fresh database with seeding
+mfs() {
+    php artisan migrate:fresh --seed "$@"
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Directory Functions
+# ─────────────────────────────────────────────────────────────────────
+
+# Create directory and cd into it
+mkd() {
+    mkdir -p "$@" && cd "$_"
+}
+
+# Create a new Laravel project and cd into it
+laravel-new() {
+    if [ -z "$1" ]; then
+        echo "Usage: laravel-new <project-name>"
+        return 1
+    fi
+    composer create-project laravel/laravel "$1" && cd "$1"
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Git Functions
+# ─────────────────────────────────────────────────────────────────────
+
+# Clone and cd into repo
+clone() {
+    if [ -z "$1" ]; then
+        echo "Usage: clone <repo>"
+        return 1
+    fi
+    gh repo clone "$1" && cd "$(basename "$1" .git)"
+}
+
+# Prune local branches that have been merged
+git-prune-local() {
+    git fetch -p
+    git branch -vv | grep ': gone]' | awk '{print $1}' | xargs -r git branch -d
+}
+
+# Delete branch locally and remotely
+git-delete-branch() {
+    if [ -z "$1" ]; then
+        echo "Usage: git-delete-branch <branch-name>"
+        return 1
+    fi
+    git branch -d "$1" 2>/dev/null
+    git push origin --delete "$1" 2>/dev/null
+    echo "Deleted branch: $1"
+}
+
+# Interactive branch switcher using fzf
+gswitch() {
+    local branch
+    branch=$(git branch --all | grep -v HEAD | fzf --height 40% --reverse | sed 's/.* //' | sed 's#remotes/origin/##')
+    if [ -n "$branch" ]; then
+        git checkout "$branch"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Database Functions (DBngin with socket)
+# ─────────────────────────────────────────────────────────────────────
+
+# MySQL command using DBngin socket
+mysql-local() {
+    mysql --socket=/tmp/mysql_3306.sock "$@"
+}
+
+# Create a database
+db-create() {
+    if [ -z "$1" ]; then
+        echo "Usage: db-create <database-name>"
+        return 1
+    fi
+    mysql --socket=/tmp/mysql_3306.sock -e "CREATE DATABASE IF NOT EXISTS \`$1\`"
+    echo "Created database: $1"
+}
+
+# Drop a database
+db-drop() {
+    if [ -z "$1" ]; then
+        echo "Usage: db-drop <database-name>"
+        return 1
+    fi
+    read "confirm?Are you sure you want to drop '$1'? (y/N) "
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        mysql --socket=/tmp/mysql_3306.sock -e "DROP DATABASE IF EXISTS \`$1\`"
+        echo "Dropped database: $1"
+    fi
+}
+
+# List all databases
+db-list() {
+    mysql --socket=/tmp/mysql_3306.sock -e "SHOW DATABASES"
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Utility Functions
+# ─────────────────────────────────────────────────────────────────────
+
+# Extract any archive
+extract() {
+    if [ -f "$1" ]; then
+        case "$1" in
+            *.tar.bz2)   tar xjf "$1"     ;;
+            *.tar.gz)    tar xzf "$1"     ;;
+            *.bz2)       bunzip2 "$1"     ;;
+            *.rar)       unrar e "$1"     ;;
+            *.gz)        gunzip "$1"      ;;
+            *.tar)       tar xf "$1"      ;;
+            *.tbz2)      tar xjf "$1"     ;;
+            *.tgz)       tar xzf "$1"     ;;
+            *.zip)       unzip "$1"       ;;
+            *.Z)         uncompress "$1"  ;;
+            *.7z)        7z x "$1"        ;;
+            *)           echo "'$1' cannot be extracted via extract()" ;;
+        esac
+    else
+        echo "'$1' is not a valid file"
+    fi
+}
+
+# Quick HTTP server in current directory
+serve() {
+    local port="${1:-8000}"
+    php -S localhost:"$port"
+}
+
+# Weather in terminal
+weather() {
+    curl -s "wttr.in/${1:-}"
+}
+
+# Quick note
+note() {
+    if [ -z "$1" ]; then
+        cat ~/.notes 2>/dev/null
+    else
+        echo "$(date '+%Y-%m-%d %H:%M'): $*" >> ~/.notes
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# FZF Enhanced Functions
+# ─────────────────────────────────────────────────────────────────────
+
+# Fuzzy find and edit file
+fe() {
+    local file
+    file=$(fzf --preview 'bat --color=always --line-range :500 {}')
+    if [ -n "$file" ]; then
+        ${EDITOR:-vim} "$file"
+    fi
+}
+
+# Fuzzy find and cd into directory
+fcd() {
+    local dir
+    dir=$(fd --type d | fzf --preview 'eza --tree --level=1 --icons {}')
+    if [ -n "$dir" ]; then
+        cd "$dir"
+    fi
+}
+
+# Fuzzy search command history
+fh() {
+    local cmd
+    cmd=$(history | fzf --tac | sed 's/^ *[0-9]* *//')
+    if [ -n "$cmd" ]; then
+        print -z "$cmd"
+    fi
+}

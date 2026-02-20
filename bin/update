@@ -1,0 +1,77 @@
+#!/bin/bash
+
+set -e
+
+DOTFILES="$HOME/.dotfiles"
+
+# Colors for output
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+success() { echo -e "${GREEN}[OK]${NC} $1"; }
+
+echo ""
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║                     Updating Dotfiles                         ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────
+# Update dotfiles repo
+# ─────────────────────────────────────────────────────────────────────
+info "Pulling latest dotfiles..."
+cd "$DOTFILES"
+git pull origin main 2>/dev/null || git pull origin master 2>/dev/null || true
+success "Dotfiles updated"
+
+# ─────────────────────────────────────────────────────────────────────
+# Update Homebrew and packages
+# ─────────────────────────────────────────────────────────────────────
+info "Updating Homebrew..."
+brew update
+success "Homebrew updated"
+
+info "Upgrading Homebrew packages..."
+brew upgrade
+success "Packages upgraded"
+
+info "Cleaning up Homebrew..."
+brew cleanup
+success "Homebrew cleaned"
+
+# ─────────────────────────────────────────────────────────────────────
+# Update Oh My Zsh
+# ─────────────────────────────────────────────────────────────────────
+info "Updating Oh My Zsh..."
+if [ -d "$HOME/.oh-my-zsh" ]; then
+    cd "$HOME/.oh-my-zsh"
+    git pull origin master --quiet
+    success "Oh My Zsh updated"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Update global Composer packages
+# ─────────────────────────────────────────────────────────────────────
+info "Updating global Composer packages..."
+if command -v composer &>/dev/null; then
+    composer global update --quiet
+    success "Composer packages updated"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Update Node via FNM
+# ─────────────────────────────────────────────────────────────────────
+info "Checking Node updates..."
+if command -v fnm &>/dev/null; then
+    fnm install --lts
+    success "Node LTS updated"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Done!
+# ─────────────────────────────────────────────────────────────────────
+echo ""
+success "All updates complete!"
+echo ""

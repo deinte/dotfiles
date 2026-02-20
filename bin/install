@@ -1,0 +1,248 @@
+#!/bin/bash
+
+set -e
+
+DOTFILES="$HOME/.dotfiles"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+success() { echo -e "${GREEN}[OK]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Check if running from correct location
+if [ ! -d "$DOTFILES" ]; then
+    error "Dotfiles not found at $DOTFILES"
+    error "Please clone to ~/.dotfiles first:"
+    echo "  git clone git@github.com:deinte/dotfiles.git ~/.dotfiles"
+    exit 1
+fi
+
+cd "$DOTFILES"
+
+echo ""
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║                    Dotfiles Installation                      ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────
+# Xcode Command Line Tools
+# ─────────────────────────────────────────────────────────────────────
+info "Checking Xcode Command Line Tools..."
+if ! xcode-select -p &>/dev/null; then
+    info "Installing Xcode Command Line Tools..."
+    xcode-select --install
+    echo "Press any key when installation is complete..."
+    read -n 1
+fi
+success "Xcode Command Line Tools installed"
+
+# ─────────────────────────────────────────────────────────────────────
+# Homebrew
+# ─────────────────────────────────────────────────────────────────────
+info "Checking Homebrew..."
+if ! command -v brew &>/dev/null; then
+    info "Installing Homebrew..."
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+    # Add Homebrew to PATH for Apple Silicon
+    if [[ $(uname -m) == "arm64" ]]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+    fi
+fi
+success "Homebrew installed"
+
+# Install all packages from Brewfile
+info "Installing Homebrew packages from Brewfile..."
+brew bundle --file="$DOTFILES/config/Brewfile" || warn "Some packages failed to install"
+success "Homebrew packages installed"
+
+# ─────────────────────────────────────────────────────────────────────
+# Oh My Zsh
+# ─────────────────────────────────────────────────────────────────────
+info "Checking Oh My Zsh..."
+if [ ! -d "$HOME/.oh-my-zsh" ]; then
+    info "Installing Oh My Zsh..."
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+fi
+success "Oh My Zsh installed"
+
+# ─────────────────────────────────────────────────────────────────────
+# Symlink Home Files
+# ─────────────────────────────────────────────────────────────────────
+info "Creating symlinks for home files..."
+
+link_file() {
+    local src="$1"
+    local dest="$2"
+
+    if [ -L "$dest" ]; then
+        rm "$dest"
+    elif [ -f "$dest" ]; then
+        mv "$dest" "$dest.backup"
+        warn "Backed up existing $dest to $dest.backup"
+    fi
+
+    ln -s "$src" "$dest"
+    success "Linked $(basename $dest)"
+}
+
+link_dir() {
+    local src="$1"
+    local dest="$2"
+
+    if [ -L "$dest" ]; then
+        rm "$dest"
+    elif [ -d "$dest" ]; then
+        mv "$dest" "$dest.backup"
+        warn "Backed up existing $dest to $dest.backup"
+    fi
+
+    ln -s "$src" "$dest"
+    success "Linked $(basename $dest)/"
+}
+
+# Link all files from home/ to ~/
+for file in "$DOTFILES/home/".*; do
+    if [ -f "$file" ]; then
+        filename=$(basename "$file")
+        link_file "$file" "$HOME/$filename"
+    fi
+done
+
+# ─────────────────────────────────────────────────────────────────────
+# Starship Config
+# ─────────────────────────────────────────────────────────────────────
+info "Setting up Starship prompt..."
+mkdir -p "$HOME/.config"
+link_file "$DOTFILES/config/starship.toml" "$HOME/.config/starship.toml"
+
+# ─────────────────────────────────────────────────────────────────────
+# Zed Editor Config
+# ─────────────────────────────────────────────────────────────────────
+info "Setting up Zed editor config..."
+ZED_CONFIG="$HOME/.config/zed"
+mkdir -p "$ZED_CONFIG"
+link_file "$DOTFILES/config/zed/settings.json" "$ZED_CONFIG/settings.json"
+link_file "$DOTFILES/config/zed/keymap.json" "$ZED_CONFIG/keymap.json"
+
+# ─────────────────────────────────────────────────────────────────────
+# Claude Code Config (skills, agents, settings)
+# ─────────────────────────────────────────────────────────────────────
+info "Setting up Claude Code config..."
+CLAUDE_CONFIG="$HOME/.claude"
+CLAUDE_DOTFILES="$DOTFILES/config/claude"
+
+# Create Claude config directory if it doesn't exist
+mkdir -p "$CLAUDE_CONFIG"
+
+# Link specific config directories (not the whole folder, so Claude can write runtime data)
+CLAUDE_DIRS=(agents skills commands hooks plugins get-shit-done)
+for dir in "${CLAUDE_DIRS[@]}"; do
+    if [ -d "$CLAUDE_DOTFILES/$dir" ]; then
+        link_dir "$CLAUDE_DOTFILES/$dir" "$CLAUDE_CONFIG/$dir"
+    fi
+done
+
+# Link settings.json
+if [ -f "$CLAUDE_DOTFILES/settings.json" ]; then
+    link_file "$CLAUDE_DOTFILES/settings.json" "$CLAUDE_CONFIG/settings.json"
+fi
+
+success "Claude Code config linked (skills, agents, settings)"
+
+# ─────────────────────────────────────────────────────────────────────
+# FNM (Fast Node Manager)
+# ─────────────────────────────────────────────────────────────────────
+info "Setting up FNM..."
+if command -v fnm &>/dev/null; then
+    # Install latest LTS Node
+    fnm install --lts
+    fnm default lts-latest
+    success "Node LTS installed via FNM"
+else
+    warn "FNM not found, skipping Node setup"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# PHP Extensions
+# ─────────────────────────────────────────────────────────────────────
+info "Installing PHP extensions..."
+if command -v pecl &>/dev/null; then
+    # Try to install common extensions (may fail if already installed)
+    pecl install imagick 2>/dev/null || true
+    pecl install redis 2>/dev/null || true
+    pecl install xdebug 2>/dev/null || true
+    success "PHP extensions installed (or already present)"
+else
+    warn "PECL not found, skipping PHP extensions"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Global Composer Packages
+# ─────────────────────────────────────────────────────────────────────
+info "Installing global Composer packages..."
+if command -v composer &>/dev/null; then
+    composer global require laravel/pint laravel/envoy laravel/valet --quiet
+    success "Global Composer packages installed"
+else
+    warn "Composer not found, skipping global packages"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Laravel Valet
+# ─────────────────────────────────────────────────────────────────────
+info "Setting up Laravel Valet..."
+if command -v valet &>/dev/null; then
+    valet install
+    success "Laravel Valet installed"
+else
+    # Try via composer global bin
+    COMPOSER_BIN="$HOME/.composer/vendor/bin"
+    if [ -x "$COMPOSER_BIN/valet" ]; then
+        "$COMPOSER_BIN/valet" install
+        success "Laravel Valet installed"
+    else
+        warn "Valet not found, please install manually"
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# FZF Key Bindings
+# ─────────────────────────────────────────────────────────────────────
+info "Setting up FZF..."
+if command -v fzf &>/dev/null; then
+    # Source fzf key bindings (Homebrew location)
+    FZF_PREFIX="$(brew --prefix fzf 2>/dev/null)"
+    if [ -n "$FZF_PREFIX" ] && [ -f "$FZF_PREFIX/install" ]; then
+        "$FZF_PREFIX/install" --key-bindings --completion --no-update-rc --no-bash --no-fish
+    fi
+    success "FZF configured"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Make scripts executable
+# ─────────────────────────────────────────────────────────────────────
+chmod +x "$DOTFILES/bin/"*
+chmod +x "$DOTFILES/macos/"*.sh 2>/dev/null || true
+
+# ─────────────────────────────────────────────────────────────────────
+# Done!
+# ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║                    Installation Complete!                     ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""
+success "All done! Please restart your terminal or run: exec zsh"
+echo ""
+info "Optional: Run macOS defaults with:"
+echo "  ~/.dotfiles/macos/set-defaults.sh"
+echo ""

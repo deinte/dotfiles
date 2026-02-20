@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(vendor/bin/pint:*)",
+      "Bash(./vendor/bin/pint:*)",
+      "Bash(php -l:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)"
+    ],
+    "defaultMode": "default"
+  },
+  "enabledPlugins": {
+    "codebase-cleanup@claude-code-workflows": true,
+    "documentation-generation@claude-code-workflows": true,
+    "frontend-design@claude-plugins-official": true,
+    "filament-specialist@mwguerra-marketplace": true
+  },
+  "alwaysThinkingEnabled": true,
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$HOME/.claude/hooks/gsd-check-update.js\""
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "node \"$HOME/.claude/hooks/statusline.js\""
+  }
+}
