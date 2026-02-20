@@ -59,7 +59,7 @@ cask "zed"             # Fast code editor
 cask "jetbrains-toolbox"
 
 # PHP/Laravel Tools
-cask "phpmon"          # PHP version manager UI
+cask "nicoverbruggen/cask/phpmon"  # PHP version manager UI
 cask "dbngin"          # Database server manager
 cask "tableplus"       # Database GUI
 cask "ray"             # Laravel Ray debugger
