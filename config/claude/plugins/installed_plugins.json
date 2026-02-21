@@ -24,10 +24,10 @@
     "frontend-design@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-plugins-official/frontend-design/e30768372b41",
-        "version": "e30768372b41",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-plugins-official/frontend-design/unknown",
+        "version": "unknown",
         "installedAt": "2026-01-10T11:11:41.564Z",
-        "lastUpdated": "2026-01-23T09:33:10.398Z"
+        "lastUpdated": "2026-02-21T13:47:49.979Z"
       }
     ],
     "filament-specialist@mwguerra-marketplace": [

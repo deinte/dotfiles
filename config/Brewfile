@@ -58,6 +58,7 @@ cask "warp"            # Modern terminal
 cask "zed"             # Fast code editor
 cask "jetbrains-toolbox"
 cask "docker"          # Docker Desktop
+cask "tower"           # Git client
 
 # PHP/Laravel Tools
 cask "nicoverbruggen/cask/phpmon"  # PHP version manager UI
@@ -78,11 +79,13 @@ cask "1password-cli"   # 1Password CLI (for SSH keys)
 cask "cleanshot"       # Screenshot tool
 cask "readdle-spark"   # Email client
 cask "slack"           # Team communication
+cask "whatsapp"        # Messaging
 
 # Utilities
 cask "imageoptim"      # Image compression
 brew "imageoptim-cli"  # CLI for git hooks
 cask "yaak"            # API client
+cask "wifiman"         # Network scanner
 
 # ─────────────────────────────────────────────────────────────────────
 # Fonts

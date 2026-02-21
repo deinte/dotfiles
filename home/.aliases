@@ -88,6 +88,7 @@ alias gstp="git stash pop"
 alias grb="git rebase"
 alias grbi="git rebase -i"
 alias gm="git merge"
+alias nah="git reset --hard;git clean -df"
 
 # ─────────────────────────────────────────────────────────────────────
 # Claude Code
@@ -103,9 +104,6 @@ alias q="exit"
 alias ..="cd .."
 alias ...="cd ../.."
 alias ....="cd ../../.."
-
-# Open current directory in GitKraken
-alias kraken="open gitkraken://repo/\$PWD"
 
 # System
 alias hostfile="sudo vim /etc/hosts"

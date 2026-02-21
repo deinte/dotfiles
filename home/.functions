@@ -75,6 +75,11 @@ git-delete-branch() {
     echo "Deleted branch: $1"
 }
 
+# AI-generated commit message (stages all, commits with Claude-generated message)
+gcmai() {
+    git add -A && git commit -m "$(claude -p 'generate a short commit message for these staged changes. output only the message, nothing else.' 2>/dev/null)"
+}
+
 # Interactive branch switcher using fzf
 gswitch() {
     local branch

@@ -13,7 +13,7 @@
       "repo": "anthropics/claude-plugins-official"
     },
     "installLocation": "/Users/danteschrauwen/.claude/plugins/marketplaces/claude-plugins-official",
-    "lastUpdated": "2026-01-19T20:00:10.546Z"
+    "lastUpdated": "2026-02-21T14:38:06.373Z"
   },
   "claude-code-plugins": {
     "source": {
@@ -21,7 +21,7 @@
       "repo": "anthropics/claude-code"
     },
     "installLocation": "/Users/danteschrauwen/.claude/plugins/marketplaces/claude-code-plugins",
-    "lastUpdated": "2026-01-23T09:41:54.867Z"
+    "lastUpdated": "2026-02-21T13:47:49.978Z"
   },
   "mwguerra-marketplace": {
     "source": {
