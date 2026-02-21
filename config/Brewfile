@@ -75,6 +75,7 @@ cask "1password"       # Password manager
 cask "1password-cli"   # 1Password CLI (for SSH keys)
 cask "cleanshot"       # Screenshot tool
 cask "readdle-spark"   # Email client
+cask "slack"           # Team communication
 
 # Utilities
 cask "imageoptim"      # Image compression
