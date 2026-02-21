@@ -37,6 +37,10 @@ info "Upgrading Homebrew packages..."
 brew upgrade
 success "Packages upgraded"
 
+info "Installing new packages from Brewfile..."
+brew bundle --file="$DOTFILES/config/Brewfile" || true
+success "Brewfile processed"
+
 info "Cleaning up Homebrew..."
 brew cleanup
 success "Homebrew cleaned"
