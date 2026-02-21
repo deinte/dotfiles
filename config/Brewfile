@@ -57,6 +57,7 @@ brew "direnv"          # Per-project env vars
 cask "warp"            # Modern terminal
 cask "zed"             # Fast code editor
 cask "jetbrains-toolbox"
+cask "docker"          # Docker Desktop
 
 # PHP/Laravel Tools
 cask "nicoverbruggen/cask/phpmon"  # PHP version manager UI
