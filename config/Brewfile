@@ -70,7 +70,8 @@ cask "google-chrome"   # For testing/DevTools
 
 # Productivity
 cask "raycast"         # Spotlight replacement
-cask "claude-code"     # Claude AI assistant
+cask "claude"          # Claude desktop app
+cask "claude-code"     # Claude CLI
 cask "1password"       # Password manager
 cask "1password-cli"   # 1Password CLI (for SSH keys)
 cask "cleanshot"       # Screenshot tool
@@ -87,10 +88,3 @@ cask "yaak"            # API client
 # ─────────────────────────────────────────────────────────────────────
 cask "font-meslo-lg-nerd-font"
 
-# ─────────────────────────────────────────────────────────────────────
-# QuickLook Plugins
-# ─────────────────────────────────────────────────────────────────────
-cask "qlcolorcode"     # Syntax highlighting
-cask "qlstephen"       # Plain text files
-cask "qlmarkdown"      # Markdown preview
-cask "quicklook-json"  # JSON preview
