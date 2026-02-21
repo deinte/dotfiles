@@ -1,0 +1,23 @@
+#!/bin/bash
+#
+# Global pre-commit hook
+# Optimizes images before commit using ImageOptim (lossless)
+
+# Get staged image files (new or modified)
+images=$(git diff --cached --name-only --diff-filter=ACM -- '*.png' '*.jpg' '*.jpeg' '*.gif' '*.webp' 2>/dev/null)
+
+if [ -n "$images" ]; then
+    # Check if imageoptim CLI is available
+    if command -v imageoptim &>/dev/null; then
+        echo "🖼  Optimizing images..."
+        echo "$images" | tr '\n' '\0' | xargs -0 imageoptim
+
+        # Re-stage the optimized images
+        echo "$images" | tr '\n' '\0' | xargs -0 git add
+
+        echo "✓  Images optimized"
+    fi
+fi
+
+# Continue with commit
+exit 0

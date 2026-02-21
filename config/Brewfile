@@ -78,6 +78,7 @@ cask "readdle-spark"   # Email client
 
 # Utilities
 cask "imageoptim"      # Image compression
+brew "imageoptim-cli"  # CLI for git hooks
 cask "yaak"            # API client
 
 # ─────────────────────────────────────────────────────────────────────
