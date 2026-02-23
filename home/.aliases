@@ -23,13 +23,17 @@ alias pint="./vendor/bin/pint"
 alias phpunit="./vendor/bin/phpunit"
 
 # Valet
+alias vs="valet secure"
 alias vc="valet composer"
 alias vcu="valet composer update"
 alias vci="valet composer install"
 alias vcr="valet composer require"
 alias vcrd="valet composer require --dev"
 alias vcda="valet composer dump-autoload"
+
 alias vphp="valet php"
+alias va="valet php artisan"
+
 alias vphp74="valet use php@7.4"
 alias vphp80="valet use php@8.0"
 alias vphp81="valet use php@8.1"
