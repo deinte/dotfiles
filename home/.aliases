@@ -22,7 +22,13 @@ alias pest="./vendor/bin/pest"
 alias pint="./vendor/bin/pint"
 alias phpunit="./vendor/bin/phpunit"
 
-# Valet PHP version switching
+# Valet
+alias vc="valet composer"
+alias vcu="valet composer update"
+alias vci="valet composer install"
+alias vcr="valet composer require"
+alias vcrd="valet composer require --dev"
+alias vcda="valet composer dump-autoload"
 alias vphp="valet php"
 alias vphp74="valet use php@7.4"
 alias vphp80="valet use php@8.0"
@@ -30,6 +36,7 @@ alias vphp81="valet use php@8.1"
 alias vphp82="valet use php@8.2"
 alias vphp83="valet use php@8.3"
 alias vphp84="valet use php@8.4"
+alias vphp85="valet use php@8.5"
 
 # ─────────────────────────────────────────────────────────────────────
 # Modern CLI Replacements
