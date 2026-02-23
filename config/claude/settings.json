@@ -32,5 +32,6 @@
     "filament-specialist@mwguerra-marketplace": true
   },
   "alwaysThinkingEnabled": true,
-  "effortLevel": "medium"
+  "effortLevel": "medium",
+  "skipDangerousModePermissionPrompt": true
 }

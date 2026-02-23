@@ -5,6 +5,7 @@
 # Taps (must be first)
 # ─────────────────────────────────────────────────────────────────────
 tap "nicoverbruggen/cask"  # For PHP Monitor
+tap "shivammathur/php"     # For multiple PHP versions
 
 # ─────────────────────────────────────────────────────────────────────
 # CLI Tools
@@ -57,7 +58,7 @@ brew "direnv"          # Per-project env vars
 cask "warp"            # Modern terminal
 cask "zed"             # Fast code editor
 cask "jetbrains-toolbox"
-cask "docker"          # Docker Desktop
+cask "docker-desktop"  # Docker Desktop
 cask "tower"           # Git client
 
 # PHP/Laravel Tools
@@ -80,11 +81,12 @@ cask "cleanshot"       # Screenshot tool
 cask "readdle-spark"   # Email client
 cask "slack"           # Team communication
 cask "whatsapp"        # Messaging
+cask "spotify"         # Music streaming
 
 # Utilities
 cask "imageoptim"      # Image compression
 brew "imageoptim-cli"  # CLI for git hooks
-cask "yaak"            # API client
+cask "bruno"           # API client
 cask "wifiman"         # Network scanner
 
 # ─────────────────────────────────────────────────────────────────────
