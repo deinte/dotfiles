@@ -33,7 +33,7 @@ alias vcda="valet composer dump-autoload"
 
 alias vphp="valet php"
 alias va="valet php artisan"
-
+alias vah="valet php artisan horizon"
 alias vphp74="valet use php@7.4"
 alias vphp80="valet use php@8.0"
 alias vphp81="valet use php@8.1"
