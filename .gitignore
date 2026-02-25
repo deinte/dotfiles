@@ -19,5 +19,10 @@ config/claude/todos/
 config/claude/ide/
 config/claude/projects/
 
+# Claude Code - plugin runtime data (timestamps update on every launch)
+config/claude/plugins/blocklist.json
+config/claude/plugins/known_marketplaces.json
+config/claude/plugins/marketplaces/
+
 # Local overrides (not committed)
 home/.zshrc.local
