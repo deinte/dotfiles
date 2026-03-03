@@ -77,7 +77,11 @@ git-delete-branch() {
 
 # AI-generated commit message (stages all, commits with Claude-generated message)
 gcmai() {
-    git add -A && git commit -m "$(claude -p --model haiku 'generate a short commit message for these staged changes. output only the message, nothing else.' 2>/dev/null)"
+    git add -A
+    local msg
+    msg=$(git diff --cached --stat | ollama run qwen2.5:0.5b "Generate a short git commit message for these changes. Output only the message, nothing else." 2>/dev/null | tr -d '\n')
+    [ -z "$msg" ] && echo "Failed to generate commit message" && return 1
+    git commit -m "$msg"
 }
 
 # Interactive branch switcher using fzf
