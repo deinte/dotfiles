@@ -117,9 +117,11 @@ for dir in agents skills commands hooks plugins get-shit-done; do
         ln -sf ~/.dotfiles/config/claude/$dir ~/.claude/$dir
     fi
 done
-if [ -f ~/.dotfiles/config/claude/settings.json ]; then
-    ln -sf ~/.dotfiles/config/claude/settings.json ~/.claude/settings.json
-fi
+for file in settings.json CLAUDE.md; do
+    if [ -f ~/.dotfiles/config/claude/$file ]; then
+        ln -sf ~/.dotfiles/config/claude/$file ~/.claude/$file
+    fi
+done
 success "Claude Code configured"
 
 # ─────────────────────────────────────────────────────────────────────

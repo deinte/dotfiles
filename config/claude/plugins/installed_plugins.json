@@ -24,10 +24,10 @@
     "frontend-design@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-plugins-official/frontend-design/205b6e0b3036",
-        "version": "205b6e0b3036",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-plugins-official/frontend-design/b36fd4b75301",
+        "version": "b36fd4b75301",
         "installedAt": "2026-01-10T11:11:41.564Z",
-        "lastUpdated": "2026-03-04T07:58:55.042Z"
+        "lastUpdated": "2026-03-12T09:23:11.491Z"
       }
     ],
     "filament-specialist@mwguerra-marketplace": [
@@ -38,6 +38,16 @@
         "installedAt": "2026-01-18T12:36:35.803Z",
         "lastUpdated": "2026-01-18T12:36:35.803Z",
         "gitCommitSha": "966a4b800b0f75df265b996bbb7c5b237f554e13"
+      }
+    ],
+    "php-lsp@claude-plugins-official": [
+      {
+        "scope": "user",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-plugins-official/php-lsp/1.0.0",
+        "version": "1.0.0",
+        "installedAt": "2026-03-12T09:29:27.981Z",
+        "lastUpdated": "2026-03-12T09:29:27.981Z",
+        "gitCommitSha": "b36fd4b753018b0b340803579399992a32e43502"
       }
     ]
   }
