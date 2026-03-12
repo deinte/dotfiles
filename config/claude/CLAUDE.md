@@ -1,8 +1,13 @@
 # Global Claude Code Guidelines
 
-## Code Style
+## Skills
 
-- Follow the Spatie PHP & Laravel guidelines (`/php-guidelines-from-spatie` skill) for all PHP/Laravel projects.
+Always load the relevant skill before starting work. Skills provide critical guidelines and patterns — use them proactively, don't wait to be asked.
+
+- `/php-guidelines-from-spatie` — Any PHP/Laravel code (writing, reviewing, refactoring)
+- `/frontend-design` — UI design, styling, visual components, layouts
+- `/web-design-guidelines` — Reviewing UI, checking accessibility, auditing UX
+- `/simplify` — After writing or changing code, review for quality and efficiency
 
 ### Code Intelligence
 
