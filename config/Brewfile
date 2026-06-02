@@ -79,7 +79,7 @@ cask "1password"       # Password manager
 cask "1password-cli"   # 1Password CLI (for SSH keys)
 cask "cleanshot"       # Screenshot tool
 cask "readdle-spark"   # Email client
-cask "linear-linear"   # Project management
+cask "linear"          # Project management
 cask "slack"           # Team communication
 cask "whatsapp"        # Messaging
 cask "spotify"         # Music streaming
