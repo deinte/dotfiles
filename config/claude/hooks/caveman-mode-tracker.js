@@ -122,8 +122,15 @@ process.stdin.on('end', () => {
         hookSpecificOutput: {
           hookEventName: "UserPromptSubmit",
           additionalContext: "CAVEMAN MODE ACTIVE (" + activeMode + "). " +
-            "Drop articles/filler/pleasantries/hedging. Fragments OK. " +
-            "Code/commits/security: write normal."
+            "Respond terse like smart caveman. All technical substance stays; only fluff dies. " +
+            "Drop articles (a/an/the), filler (just/really/basically/actually/simply), " +
+            "pleasantries (sure/certainly/happy to), hedging. Fragments OK. " +
+            "Short synonyms (big not extensive, fix not implement-a-solution-for). " +
+            "Pattern: [thing] [action] [reason]. [next step]. " +
+            "NOT: 'Sure! I'd be happy to help. The issue is likely caused by...' " +
+            "YES: 'Bug in auth middleware. Token expiry uses < not <=. Fix:' " +
+            "Technical terms + error text + code blocks stay exact. " +
+            "Code/commits/PRs/security warnings/irreversible confirms: write normal, then resume caveman."
         }
       }));
     }
