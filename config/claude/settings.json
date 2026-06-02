@@ -9,9 +9,10 @@
       "Bash(./vendor/bin/pint:*)",
       "Bash(php -l:*)",
       "Bash(grep:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(php artisan *)"
     ],
-    "defaultMode": "default"
+    "defaultMode": "auto"
   },
   "hooks": {
     "SessionStart": [
@@ -20,6 +21,28 @@
           {
             "type": "command",
             "command": "node \"$HOME/.claude/hooks/gsd-check-update.js\""
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$HOME/.claude/hooks/caveman-activate.js\"",
+            "timeout": 5,
+            "statusMessage": "Loading caveman mode..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$HOME/.claude/hooks/caveman-mode-tracker.js\"",
+            "timeout": 5,
+            "statusMessage": "Tracking caveman mode..."
           }
         ]
       }
@@ -34,8 +57,13 @@
     "documentation-generation@claude-code-workflows": true,
     "frontend-design@claude-plugins-official": true,
     "filament-specialist@mwguerra-marketplace": true,
-    "php-lsp@claude-plugins-official": true
+    "php-lsp@claude-plugins-official": true,
+    "figma@claude-plugins-official": true
   },
   "alwaysThinkingEnabled": true,
-  "skipDangerousModePermissionPrompt": true
+  "effortLevel": "high",
+  "skipDangerousModePermissionPrompt": true,
+  "skipAutoPermissionPrompt": true,
+  "voiceEnabled": false,
+  "agentPushNotifEnabled": false
 }
