@@ -107,6 +107,15 @@ ln -sf ~/.dotfiles/bin/php-format ~/bin/php-format
 success "Symlinks created"
 
 # ─────────────────────────────────────────────────────────────────────
+# Claude Code CLI (native installer — not Homebrew)
+# ─────────────────────────────────────────────────────────────────────
+if ! command -v claude &>/dev/null; then
+    step "Installing Claude Code CLI (native)"
+    curl -fsSL https://claude.ai/install.sh | bash
+    success "Claude Code CLI installed"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
 # Claude Code config
 # ─────────────────────────────────────────────────────────────────────
 step "Setting up Claude Code config"

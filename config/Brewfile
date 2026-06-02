@@ -74,7 +74,7 @@ cask "google-chrome"   # For testing/DevTools
 # Productivity
 cask "raycast"         # Spotlight replacement
 cask "claude"          # Claude desktop app
-cask "claude-code"     # Claude CLI
+# claude-code CLI installed via native installer (see bin/install), not Homebrew
 cask "1password"       # Password manager
 cask "1password-cli"   # 1Password CLI (for SSH keys)
 cask "cleanshot"       # Screenshot tool
