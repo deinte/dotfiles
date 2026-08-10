@@ -8,6 +8,15 @@ Always load the relevant skill before starting work. Skills provide critical gui
 - `/frontend-design` — UI design, styling, visual components, layouts
 - `/web-design-guidelines` — Reviewing UI, checking accessibility, auditing UX
 - `/simplify` — After writing or changing code, review for quality and efficiency
+- `/saloon-laravel-sdk` — Any Saloon connector or API integration work
+
+## API SDKs (Saloon)
+
+Connectors expose resource classes, never flat methods: `$connector->conversations()->search()`,
+`$connector->conversations()->comments($id)->create($body)`, `$connector->inboxes()->list()`.
+Connector methods only hand out `Resources/{Name}Resource` instances; resources hold the `send()`
+calls; one Request class per endpoint. Scope nested resources where natural
+(`comments($conversationId)->create($body)`).
 
 ### Code Intelligence
 

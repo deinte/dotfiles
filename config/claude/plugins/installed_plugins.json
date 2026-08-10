@@ -4,30 +4,30 @@
     "codebase-cleanup@claude-code-workflows": [
       {
         "scope": "user",
-        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-code-workflows/codebase-cleanup/unknown",
-        "version": "unknown",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-code-workflows/codebase-cleanup/1.2.0",
+        "version": "1.2.0",
         "installedAt": "2025-11-12T14:36:45.750Z",
-        "lastUpdated": "2025-11-12T14:36:45.750Z",
+        "lastUpdated": "2026-03-20T12:17:14.330Z",
         "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831"
       }
     ],
     "documentation-generation@claude-code-workflows": [
       {
         "scope": "user",
-        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-code-workflows/documentation-generation/unknown",
-        "version": "unknown",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-code-workflows/documentation-generation/1.2.0",
+        "version": "1.2.0",
         "installedAt": "2025-11-12T21:03:47.297Z",
-        "lastUpdated": "2025-11-12T21:03:47.297Z",
+        "lastUpdated": "2026-03-20T12:17:14.683Z",
         "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831"
       }
     ],
     "frontend-design@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-plugins-official/frontend-design/b36fd4b75301",
-        "version": "b36fd4b75301",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-plugins-official/frontend-design/unknown",
+        "version": "unknown",
         "installedAt": "2026-01-10T11:11:41.564Z",
-        "lastUpdated": "2026-03-12T09:23:11.491Z"
+        "lastUpdated": "2026-08-10T08:06:58.499Z"
       }
     ],
     "filament-specialist@mwguerra-marketplace": [
@@ -48,6 +48,26 @@
         "installedAt": "2026-03-12T09:29:27.981Z",
         "lastUpdated": "2026-03-12T09:29:27.981Z",
         "gitCommitSha": "b36fd4b753018b0b340803579399992a32e43502"
+      }
+    ],
+    "figma@claude-plugins-official": [
+      {
+        "scope": "user",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-plugins-official/figma/2.2.91",
+        "version": "2.2.91",
+        "installedAt": "2026-04-14T12:52:27.926Z",
+        "lastUpdated": "2026-08-09T10:14:36.927Z",
+        "gitCommitSha": "9680714bad40503ef37a9f815fd1d2cd15150af4"
+      }
+    ],
+    "warp@claude-code-warp": [
+      {
+        "scope": "user",
+        "installPath": "/Users/danteschrauwen/.claude/plugins/cache/claude-code-warp/warp/2.1.0",
+        "version": "2.1.0",
+        "installedAt": "2026-06-29T10:33:47.723Z",
+        "lastUpdated": "2026-06-29T10:33:47.723Z",
+        "gitCommitSha": "58c823da195346a7e6645fd2d9484d0e38db6bc2"
       }
     ]
   }
