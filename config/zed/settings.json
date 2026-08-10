@@ -1,4 +1,13 @@
 {
+  "cli_default_open_behavior": "new_window",
+  "agent": {
+    "dock": "right",
+    "favorite_models": [],
+    "model_parameters": []
+  },
+  "git_panel": {
+    "dock": "left"
+  },
   "base_keymap": "JetBrains",
   "theme": "One Dark",
   "ui_font_size": 14,
@@ -25,7 +34,7 @@
   "file_types": {
     "PHP": ["php", "blade.php"]
   },
-  "language_overrides": {
+  "languages": {
     "PHP": {
       "tab_size": 4,
       "format_on_save": "on",

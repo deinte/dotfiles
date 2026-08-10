@@ -1,12 +1,15 @@
 #!/bin/bash
 
 # PHP Formatter for Zed Editor
-# Formats PHP files using Laravel Pint (or falls back to php-cs-fixer)
+# Formats PHP using Laravel Pint with the project's own pint.json ruleset,
+# so format-on-save produces exactly the same output as `./vendor/bin/pint`.
 #
-# Usage: php-format <file>
+# Zed contract: the buffer is passed on STDIN, the formatted result must be
+# written to STDOUT. The real file path is passed as $1 ({buffer_path}) and is
+# used only to locate the project root / pint.json and to keep the extension.
 #
 # Configure in Zed settings.json:
-# "language_overrides": {
+# "languages": {
 #   "PHP": {
 #     "format_on_save": "on",
 #     "formatter": {
@@ -18,17 +21,13 @@
 #   }
 # }
 
-FILE="$1"
+set -euo pipefail
 
-if [ -z "$FILE" ]; then
-    echo "Usage: php-format <file>" >&2
-    exit 1
-fi
+BUFFER_PATH="${1:-}"
 
-# Find project root (look for composer.json)
 find_project_root() {
     local dir="$1"
-    while [ "$dir" != "/" ]; do
+    while [ -n "$dir" ] && [ "$dir" != "/" ]; do
         if [ -f "$dir/composer.json" ]; then
             echo "$dir"
             return
@@ -38,29 +37,37 @@ find_project_root() {
     echo ""
 }
 
-PROJECT_ROOT=$(find_project_root "$(dirname "$FILE")")
+PROJECT_ROOT=""
+if [ -n "$BUFFER_PATH" ]; then
+    PROJECT_ROOT=$(find_project_root "$(dirname "$BUFFER_PATH")")
+fi
 
-# Try project-local Pint first
+# Work on a temp copy of the STDIN buffer (Pint formats files, not stdin).
+TMP_FILE=$(mktemp -t php-format.XXXXXX.php)
+trap 'rm -f "$TMP_FILE"' EXIT
+cat > "$TMP_FILE"
+
+# Resolve a Pint binary: project-local, then global, then Composer global.
+PINT=""
 if [ -n "$PROJECT_ROOT" ] && [ -x "$PROJECT_ROOT/vendor/bin/pint" ]; then
-    "$PROJECT_ROOT/vendor/bin/pint" "$FILE" --quiet
-    cat "$FILE"
+    PINT="$PROJECT_ROOT/vendor/bin/pint"
+elif command -v pint &>/dev/null; then
+    PINT="pint"
+elif [ -x "$HOME/.composer/vendor/bin/pint" ]; then
+    PINT="$HOME/.composer/vendor/bin/pint"
+fi
+
+# No Pint available: return the buffer unchanged.
+if [ -z "$PINT" ]; then
+    cat "$TMP_FILE"
     exit 0
 fi
 
-# Try global Pint
-if command -v pint &>/dev/null; then
-    pint "$FILE" --quiet
-    cat "$FILE"
-    exit 0
+# Use the project's pint.json so the ruleset matches the repo exactly.
+if [ -n "$PROJECT_ROOT" ] && [ -f "$PROJECT_ROOT/pint.json" ]; then
+    "$PINT" "$TMP_FILE" --config "$PROJECT_ROOT/pint.json" --quiet >/dev/null 2>&1 || true
+else
+    "$PINT" "$TMP_FILE" --quiet >/dev/null 2>&1 || true
 fi
 
-# Try Composer global Pint
-COMPOSER_BIN="$HOME/.composer/vendor/bin"
-if [ -x "$COMPOSER_BIN/pint" ]; then
-    "$COMPOSER_BIN/pint" "$FILE" --quiet
-    cat "$FILE"
-    exit 0
-fi
-
-# Fallback: just output the file unchanged
-cat "$FILE"
+cat "$TMP_FILE"
