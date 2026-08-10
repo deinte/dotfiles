@@ -120,7 +120,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────
 step "Setting up Claude Code config"
 mkdir -p ~/.claude
-for dir in agents skills commands hooks plugins get-shit-done; do
+for dir in agents skills commands hooks plugins; do
     if [ -d ~/.dotfiles/config/claude/$dir ]; then
         rm -rf ~/.claude/$dir
         ln -sf ~/.dotfiles/config/claude/$dir ~/.claude/$dir
