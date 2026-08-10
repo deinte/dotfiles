@@ -93,7 +93,7 @@ fi
 
 info "Refreshing Claude Code config symlinks..."
 mkdir -p ~/.claude
-for dir in agents skills commands hooks plugins get-shit-done; do
+for dir in agents skills commands hooks plugins; do
     if [ -d "$DOTFILES/config/claude/$dir" ]; then
         rm -rf ~/.claude/$dir
         ln -sf "$DOTFILES/config/claude/$dir" ~/.claude/$dir
