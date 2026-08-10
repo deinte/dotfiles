@@ -74,6 +74,39 @@ if command -v fnm &>/dev/null; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────
+# Update Claude Code
+# ─────────────────────────────────────────────────────────────────────
+info "Updating Claude Code CLI..."
+if command -v claude &>/dev/null; then
+    claude update 2>/dev/null || true
+    success "Claude Code CLI updated"
+fi
+
+info "Updating Claude Code plugins..."
+if command -v claude &>/dev/null; then
+    claude plugin list 2>/dev/null | sed -n 's/.*❯ \(.*\)/\1/p' | while read -r plugin; do
+        info "  Updating plugin: $plugin"
+        claude plugin update "$plugin" 2>/dev/null || true
+    done
+    success "Claude Code plugins updated"
+fi
+
+info "Refreshing Claude Code config symlinks..."
+mkdir -p ~/.claude
+for dir in agents skills commands hooks plugins get-shit-done; do
+    if [ -d "$DOTFILES/config/claude/$dir" ]; then
+        rm -rf ~/.claude/$dir
+        ln -sf "$DOTFILES/config/claude/$dir" ~/.claude/$dir
+    fi
+done
+for file in settings.json CLAUDE.md; do
+    if [ -f "$DOTFILES/config/claude/$file" ]; then
+        ln -sf "$DOTFILES/config/claude/$file" ~/.claude/$file
+    fi
+done
+success "Claude Code config refreshed"
+
+# ─────────────────────────────────────────────────────────────────────
 # Done!
 # ─────────────────────────────────────────────────────────────────────
 echo ""
