@@ -97,3 +97,9 @@ ssh-add --apple-use-keychain ~/.ssh/id_ed25519 2>/dev/null
 if command -v starship &>/dev/null; then
     eval "$(starship init zsh)"
 fi
+export PATH="/opt/homebrew/opt/mysql-client/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
+
+
+# Added by Antigravity CLI installer
+export PATH="/Users/danteschrauwen/.local/bin:$PATH"

@@ -104,7 +104,7 @@ alias nah="git reset --hard;git clean -df"
 # ─────────────────────────────────────────────────────────────────────
 # Claude Code
 # ─────────────────────────────────────────────────────────────────────
-alias cl="claude"
+alias cl="claude --dangerously-skip-permissions"
 
 # ─────────────────────────────────────────────────────────────────────
 # General Utilities
