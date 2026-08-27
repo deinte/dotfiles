@@ -19,7 +19,7 @@ while [[ -L "$SOURCE" ]]; do
   [[ "$SOURCE" = /* ]] || SOURCE="$SOURCE_DIR/$SOURCE"
 done
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd -P)"
-DOTFILES_ROOT="${DOTFILES_ROOT:-$SCRIPT_DIR}"
+DOTFILES_ROOT="${DOTFILES_ROOT:-$(dirname "$SCRIPT_DIR")}"
 INSTALLER="$DOTFILES_ROOT/bin/install-linux-devstation"
 [[ -x "$INSTALLER" ]] || { echo "ERROR: installer not executable: $INSTALLER" >&2; exit 1; }
 cd "$DOTFILES_ROOT"
