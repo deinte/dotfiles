@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set +e
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+export NODE_PATH="$(npm root -g 2>/dev/null):${NODE_PATH:-}"
+ROOT="${AGENT_WORKSTATION_ROOT:-$HOME/agent-workstation}"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/workstation-doctor.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
+check(){
+  local label="$1"; shift
+  if "$@" >"$TMP_DIR/check.out" 2>&1; then echo "OK: $label - $(head -1 "$TMP_DIR/check.out")"; else echo "FAIL: $label - $(head -1 "$TMP_DIR/check.out")"; fi
+}
+check_quiet(){ local label="$1"; shift; if "$@" >"$TMP_DIR/check.out" 2>&1; then echo "OK: $label"; else echo "FAIL: $label"; fi; }
+echo '== dev-workstation doctor =='
+echo "Host: $(hostname)"
+echo "OS: $(lsb_release -ds 2>/dev/null || { . /etc/os-release; echo "$PRETTY_NAME"; })"
+echo "Root: $ROOT"
+echo "Disk: $(df -h / | awk 'NR==2 {print $4 " free / " $5 " used"}')"
+echo "Memory: $(free -h | awk '/Mem:/ {print $7 " available / " $2 " total"}')"
+check git git --version; check gh gh --version; check_quiet 'GitHub auth' gh auth status
+check claude\ code claude --version; check claude\ doctor claude doctor; check_quiet 'Claude auth' claude auth status --text
+check codex codex --version; check_quiet 'Codex login' codex login status
+check php php -v; check composer composer --version; check node node -v; check npm npm -v; check pnpm pnpm -v
+check python3 python3 --version; check uv uv --version; check playwright npx playwright --version
+check 'playwright chromium cache' bash -c "find '$HOME/.cache/ms-playwright' '(' -path '*/chrome-linux/chrome' -o -path '*/chrome-linux64/chrome' ')' -type f -perm /111 | grep -q ."
+check docker docker --version; check 'docker compose' docker compose version; check 'mysql client' mysql --version; check 'redis cli' redis-cli --version; check nginx nginx -v; check tailscale tailscale version
+check 'tailscaled service' systemctl is-active tailscaled; check_quiet 'tailscale auth' tailscale status; check 'user systemd' systemctl --user is-system-running; check flock flock --version; check timeout timeout --version
+runner="$ROOT/scripts/agent-task"
+if [[ -x "$runner" ]] && "$runner" --help >"$TMP_DIR/runner.out" 2>&1 && grep -q 'agent-task start' "$TMP_DIR/runner.out" && grep -q 'agent-task attach' "$TMP_DIR/runner.out" && grep -q 'agent-task status' "$TMP_DIR/runner.out" && grep -q 'agent-task wait' "$TMP_DIR/runner.out" && grep -q -- '--json' "$TMP_DIR/runner.out"; then
+  echo 'OK: agent-task supervision - attach/start/status/wait JSON interface present'
+else
+  echo 'FAIL: agent-task supervision - attach/start/status/wait JSON interface missing'
+fi

@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="${AGENT_WORKSTATION_ROOT:-$HOME/agent-workstation}"
+RUNS_DIR="$ROOT/runs"
+LOCKS_DIR="$ROOT/locks"
+mkdir -p "$RUNS_DIR" "$LOCKS_DIR"
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 2
+}
+
+slugify() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//' | cut -c1-48
+}
+
+issue_dir() { printf '%s/artifacts/%s' "$ROOT" "$1"; }
+state_file() { printf '%s/%s.env' "$RUNS_DIR" "$(slugify "$1")"; }
+
+usage() {
+    cat <<'EOF'
+agent-task prepare --project <slug> --issue <KEY> --repo <url> [--base main] [--mode dev|review] [--max-hours N]
+agent-task run ... (alias for prepare)
+agent-task attach --project <slug> --issue <KEY> --worktree <absolute-path> [--repo <url>] [--base main] [--mode dev|review] [--max-hours N]
+agent-task start --issue <KEY> --prompt-file <path> [--agent claude|codex] [--model <model>] [--effort high] [--max-minutes 30] [--max-turns 35] [--max-budget-usd 8] [--allow-dirty]
+agent-task status --issue <KEY> [--json]; agent-task stop --issue <KEY>; agent-task wait --issue <KEY> [--timeout-seconds 1800] [--json]
+
+Return codes: COMPLETED is 0. FAILED, TIMED_OUT, STOPPED, and LOST are non-zero.
+STOPPING is transitional and is not terminal; wait continues until STOPPED or LOST.
+CLI validation errors return 2. wait timeout returns 124.
+EOF
+}
+
+# All state and result files are replaced in one rename so readers never see a partial file.
+atomic_write() {
+    local file="$1"
+    local temporary="${file}.tmp.$$"
+    shift
+    umask 077
+    printf '%s' "$*" >"$temporary"
+    chmod 600 "$temporary"
+    mv -f "$temporary" "$file"
+}
+
+write_state() {
+    local file="$1"
+    local temporary="${file}.tmp.$$"
+    shift
+    umask 077
+    : >"$temporary"
+    while (($#)); do
+        printf '%s=%q\n' "$1" "$2" >>"$temporary"
+        shift 2
+    done
+    chmod 600 "$temporary"
+    mv -f "$temporary" "$file"
+}
+
+load_state() {
+    local file
+    file="$(state_file "$1")"
+    [[ -f "$file" ]] || die "No run state for $1"
+    # shellcheck disable=SC1090
+    source "$file"
+}
+
+write_run_json() {
+    python3 - "$@" <<'PY'
+import json, os, sys, tempfile
+p, project, issue, repo, base, branch, worktree, artifacts, mode, max_hours = sys.argv[1:]
+d = {'project': project, 'issue': issue, 'repo': repo, 'base': base, 'branch': branch,
+     'worktree': worktree, 'artifacts': artifacts, 'mode': mode, 'max_hours': int(max_hours)}
+if os.path.exists(p):
+    with open(p) as f:
+        d['created_at'] = json.load(f).get('created_at')
+if 'created_at' not in d:
+    from datetime import datetime, timezone
+    d['created_at'] = datetime.now(timezone.utc).isoformat()
+fd, temporary = tempfile.mkstemp(dir=os.path.dirname(p), prefix='.run.', text=True)
+with os.fdopen(fd, 'w') as f:
+    json.dump(d, f, indent=2)
+    f.write('\n')
+os.chmod(temporary, 0o600)
+os.replace(temporary, p)
+PY
+}
+
+validate_common() {
+    [[ "$1" =~ ^(dev|review)$ ]] || die 'mode must be dev or review'
+    [[ "$2" =~ ^[0-9]+$ ]] || die 'max-hours must be a non-negative integer'
+}
+
+prepare() {
+    local project='' issue='' repo='' base=main mode=dev max_hours=2
+    while (($#)); do
+        case "$1" in
+            --project) project="$2"; shift 2 ;;
+            --issue) issue="$2"; shift 2 ;;
+            --repo) repo="$2"; shift 2 ;;
+            --base) base="$2"; shift 2 ;;
+            --mode) mode="$2"; shift 2 ;;
+            --max-hours) max_hours="$2"; shift 2 ;;
+            *) die "Unknown prepare argument: $1" ;;
+        esac
+    done
+    [[ -n "$project" && -n "$issue" && -n "$repo" ]] || die 'prepare requires --project, --issue and --repo'
+    validate_common "$mode" "$max_hours"
+    local repo_dir="$ROOT/repos/$project"
+    local worktree="$ROOT/worktrees/$issue"
+    local artifacts="$(issue_dir "$issue")"
+    local branch="agent/${issue,,}-${mode}"
+    mkdir -p "$ROOT/repos" "$ROOT/worktrees" "$artifacts/screenshots"
+    [[ -d "$repo_dir/.git" ]] || git clone "$repo" "$repo_dir"
+    git -C "$repo_dir" fetch --all --prune
+    if [[ ! -e "$worktree/.git" ]]; then
+        local ref="$base"
+        if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$base"; then
+            ref="origin/$base"
+        fi
+        git -C "$repo_dir" worktree add -b "$branch" "$worktree" "$ref"
+    fi
+    write_run_json "$artifacts/run.json" "$project" "$issue" "$repo" "$base" "$branch" "$worktree" "$artifacts" "$mode" "$max_hours"
+    [[ -f "$artifacts/summary.md" ]] || printf '# Agent task %s\n' "$issue" >"$artifacts/summary.md"
+    printf 'READY\nProject: %s\nIssue: %s\nWorktree: %s\nBranch: %s\nArtifacts: %s\n' "$project" "$issue" "$worktree" "$branch" "$artifacts"
+}
+
+attach() {
+    local project='' issue='' worktree='' repo='' base=main mode=dev max_hours=2
+    while (($#)); do
+        case "$1" in
+            --project) project="$2"; shift 2 ;;
+            --issue) issue="$2"; shift 2 ;;
+            --worktree) worktree="$2"; shift 2 ;;
+            --repo) repo="$2"; shift 2 ;;
+            --base) base="$2"; shift 2 ;;
+            --mode) mode="$2"; shift 2 ;;
+            --max-hours) max_hours="$2"; shift 2 ;;
+            *) die "Unknown attach argument: $1" ;;
+        esac
+    done
+    [[ -n "$project" && -n "$issue" && -n "$worktree" ]] || die 'attach requires --project, --issue and --worktree'
+    [[ "$worktree" = /* ]] || die '--worktree must be absolute'
+    validate_common "$mode" "$max_hours"
+    [[ -d "$worktree" ]] || die "Worktree path does not exist: $worktree"
+    local git_root
+    git_root="$(git -C "$worktree" rev-parse --show-toplevel 2>/dev/null)" || die "Not a git worktree: $worktree"
+    worktree="$git_root"
+    local branch
+    branch="$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null)" || die 'Worktree HEAD is detached'
+    if [[ -z "$repo" ]]; then
+        repo="$(git -C "$worktree" config --get remote.origin.url 2>/dev/null)" || die 'Worktree has no origin URL; pass --repo explicitly'
+    fi
+    [[ -n "$repo" ]] || die 'Worktree has no origin URL; pass --repo explicitly'
+    local artifacts="$(issue_dir "$issue")"
+    local old path key unit file
+    mkdir -p "$artifacts/screenshots"
+    if [[ -f "$artifacts/run.json" ]]; then
+        old="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["worktree"])' "$artifacts/run.json")" || die 'Existing run metadata is invalid'
+        [[ -e "$old" ]] || die "Existing run worktree path is missing: $old"
+        [[ "$(realpath "$old")" == "$(realpath "$worktree")" ]] || die 'Issue/path mismatch'
+    fi
+    for file in "$ROOT"/artifacts/*/run.json; do
+        [[ -f "$file" ]] || continue
+        [[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("issue",""))' "$file")" == "$issue" ]] && continue
+        path="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("worktree",""))' "$file")"
+        if [[ -n "$path" && -e "$path" ]] && [[ "$(realpath "$path")" == "$(realpath "$worktree")" ]]; then
+            die 'Worktree already belongs to another issue'
+        fi
+    done
+    key="$(printf %s "$worktree" | sha256sum | cut -d' ' -f1)"
+    exec 8>"$LOCKS_DIR/$key.lock"
+    flock -n 8 || die 'Worktree has an active writer'
+    exec 8>&-
+    unit="agent-task-$(slugify "$issue")"
+    [[ "$(systemctl --user is-active "$unit.service" 2>/dev/null || true)" != active ]] || die 'Run already active'
+    write_run_json "$artifacts/run.json" "$project" "$issue" "$repo" "$base" "$branch" "$worktree" "$artifacts" "$mode" "$max_hours"
+    printf 'READY\nProject: %s\nIssue: %s\nWorktree: %s\nBranch: %s\nArtifacts: %s\n' "$project" "$issue" "$worktree" "$branch" "$artifacts"
+}
+
+write_runner() {
+    local runner="$1"
+cat >"$runner" <<'RUNNER'
+#!/usr/bin/env bash
+set -euo pipefail
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-15}"
+
+terminal_result() {
+    local exit_code="$1" state="$2" temporary
+    temporary="${RESULT_FILE}.tmp.$$"
+    python3 - "$temporary" "$ISSUE" "$AGENT" "$MODEL" "$state" "$exit_code" "$RUN_DIR" "$WORKTREE" "$OUTPUT_FILE" "$ERROR_FILE" "$SNAPSHOT_FILE" <<'PY'
+import json, os, sys
+p, issue, agent, model, state, code, run, worktree, output, error, snapshot = sys.argv[1:]
+d = {'state': state, 'issue': issue, 'agent': agent, 'model': model, 'service': 'inactive',
+     'wrapper_pid': 0, 'wrapper_alive': False, 'child_pid': 0, 'child_alive': False,
+     'started_at': open(os.environ['STARTED_FILE']).read().strip() if os.path.exists(os.environ['STARTED_FILE']) else None,
+     'max_minutes': int(os.environ['MAX_MINUTES']), 'run_dir': run,
+     'exit_code': int(code), 'heartbeat': open(os.environ['HEARTBEAT_FILE']).read().strip() if os.path.exists(os.environ['HEARTBEAT_FILE']) else None,
+     'worktree': worktree, 'branch': '', 'head': '', 'dirty': False,
+     'output_path': output, 'stderr_path': error, 'last_git_snapshot': snapshot}
+try:
+    import subprocess
+    d['branch'] = subprocess.run(['git','-C',worktree,'symbolic-ref','--quiet','--short','HEAD'], text=True, capture_output=True).stdout.strip()
+    d['head'] = subprocess.run(['git','-C',worktree,'rev-parse','HEAD'], text=True, capture_output=True).stdout.strip()
+    d['dirty'] = bool(subprocess.run(['git','-C',worktree,'status','--porcelain'], capture_output=True).stdout.strip())
+except Exception:
+    pass
+with open(p, 'w') as f:
+    json.dump(d, f, indent=2); f.write('\n')
+os.chmod(p, 0o600)
+os.replace(p, os.environ['RESULT_FILE'])
+PY
+}
+
+if ! exec 9>"$LOCK_FILE" || ! flock -n 9; then
+    printf '73\n' >"$EXIT_FILE"
+    terminal_result 73 FAILED
+    exit 73
+fi
+printf '%s\n' "$$" >"$WRAPPER_PID_FILE"
+printf '%s\n' "$(date -Is)" >"$STARTED_FILE"
+cd "$WORKTREE" || { terminal_result 97 FAILED; exit 97; }
+prompt="$(python3 -c 'from pathlib import Path; import os; print(Path(os.environ["PROMPT_FILE"]).read_text())')"
+case "$AGENT" in
+    claude) cmd=(claude -p "$prompt" --model "$MODEL" --effort "$EFFORT" --permission-mode bypassPermissions --max-turns "$MAX_TURNS" --max-budget-usd "$MAX_BUDGET" --output-format json) ;;
+    codex) cmd=(codex exec --model "$MODEL" --sandbox danger-full-access "$prompt") ;;
+    smoke) cmd=(bash -lc 'sleep 5; printf "SMOKE_OK\\n"') ;;
+    *) terminal_result 98 FAILED; exit 98 ;;
+esac
+
+timeout --signal=TERM --kill-after=30 "$MAX_SECONDS" "${cmd[@]}" >"$OUTPUT_FILE" 2>"$ERROR_FILE" &
+child=$!
+printf '%s\n' "$child" >"$CHILD_PID_FILE"
+
+heartbeat() {
+    while kill -0 "$child" 2>/dev/null; do
+        date -Is >"$HEARTBEAT_FILE"
+        { git status --short --branch; git diff --stat | tail -20; } >"$SNAPSHOT_FILE" 2>/dev/null || true
+        sleep "$HEARTBEAT_INTERVAL"
+    done
+}
+
+heartbeat &
+heartbeat_pid=$!
+wait "$child" || rc=$?
+rc="${rc:-0}"
+kill "$heartbeat_pid" 2>/dev/null || true
+wait "$heartbeat_pid" 2>/dev/null || true
+date -Is >"$HEARTBEAT_FILE"
+printf '%s\n' "$rc" >"$EXIT_FILE"
+if [[ -f "$REQUESTED_STOP_FILE" || "$rc" == 143 ]]; then
+    terminal_result 143 STOPPED
+elif [[ "$rc" == 124 ]]; then
+    terminal_result 124 TIMED_OUT
+elif [[ "$rc" == 0 ]]; then
+    terminal_result 0 COMPLETED
+else
+    terminal_result "$rc" FAILED
+fi
+exit "$rc"
+RUNNER
+    chmod 700 "$runner"
+}
+
+start_run() {
+    local issue='' prompt='' agent=claude model='' effort=high max_minutes=30 max_turns=35 max_budget=8 allow_dirty=false
+    while (($#)); do
+        case "$1" in
+            --issue) issue="$2"; shift 2 ;;
+            --prompt-file) prompt="$2"; shift 2 ;;
+            --agent) agent="$2"; shift 2 ;;
+            --model) model="$2"; shift 2 ;;
+            --effort) effort="$2"; shift 2 ;;
+            --max-minutes) max_minutes="$2"; shift 2 ;;
+            --max-turns) max_turns="$2"; shift 2 ;;
+            --max-budget-usd) max_budget="$2"; shift 2 ;;
+            --allow-dirty) allow_dirty=true; shift ;;
+            *) die "Unknown start argument: $1" ;;
+        esac
+    done
+    [[ -n "$issue" && -f "$prompt" ]] || die 'start requires --issue and an existing --prompt-file'
+    [[ "$agent" =~ ^(claude|codex|smoke)$ ]] || die 'bad agent'
+    [[ "$max_minutes" =~ ^[1-9][0-9]*$ && "$max_turns" =~ ^[1-9][0-9]*$ ]] || die 'limits must be positive'
+    [[ -n "$model" ]] || { if [[ "$agent" == codex ]]; then model='gpt-5.6-luna'; else model=opus; fi; }
+    local artifacts="$(issue_dir "$issue")" worktree unit stamp run runner key
+    [[ -f "$artifacts/run.json" ]] || die "No prepared task metadata at $artifacts/run.json"
+    worktree="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["worktree"])' "$artifacts/run.json")"
+    [[ -e "$worktree/.git" ]] || die 'Worktree missing'
+    [[ "$allow_dirty" == true || -z "$(git -C "$worktree" status --porcelain)" ]] || die 'Worktree is dirty; use --allow-dirty only for deliberate recovery'
+    unit="agent-task-$(slugify "$issue")"
+    [[ "$(systemctl --user is-active "$unit.service" 2>/dev/null || true)" != active ]] || die 'Run already active'
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    run="$artifacts/runs/$stamp"
+    mkdir -p "$run"
+    cp "$prompt" "$run/prompt.txt"
+    chmod 600 "$run/prompt.txt"
+    key="$(printf %s "$worktree" | sha256sum | cut -d' ' -f1)"
+    runner="$run/runner.sh"
+    write_runner "$runner"
+    rm -f "$run/requested-stop" "$run/result.json"
+    write_state "$(state_file "$issue")" ISSUE "$issue" UNIT "$unit" WORKTREE "$worktree" RUN_DIR "$run" STARTED_AT "$(date -Is)" MAX_MINUTES "$max_minutes" AGENT "$agent" MODEL "$model"
+    export ISSUE="$issue" WORKTREE="$worktree" RUN_DIR="$run" PROMPT_FILE="$run/prompt.txt" AGENT="$agent" MODEL="$model" EFFORT="$effort" MAX_TURNS="$max_turns" MAX_BUDGET="$max_budget" MAX_SECONDS="$((max_minutes * 60))" MAX_MINUTES="$max_minutes" LOCK_FILE="$LOCKS_DIR/$key.lock" EXIT_FILE="$run/exit-code" ERROR_FILE="$run/stderr.log" OUTPUT_FILE="$run/output.log" WRAPPER_PID_FILE="$run/wrapper.pid" CHILD_PID_FILE="$run/child.pid" STARTED_FILE="$run/started-at" HEARTBEAT_FILE="$run/heartbeat" SNAPSHOT_FILE="$run/snapshot.txt" RESULT_FILE="$run/result.json" REQUESTED_STOP_FILE="$run/requested-stop" HEARTBEAT_INTERVAL="${AGENT_TASK_HEARTBEAT_INTERVAL:-15}"
+    [[ "$HEARTBEAT_INTERVAL" =~ ^[1-9][0-9]*$ ]] || die 'AGENT_TASK_HEARTBEAT_INTERVAL must be a positive integer'
+    systemd-run --user --unit="$unit" --collect --property=TimeoutStopSec=35 --setenv=ISSUE --setenv=WORKTREE --setenv=RUN_DIR --setenv=PROMPT_FILE --setenv=AGENT --setenv=MODEL --setenv=EFFORT --setenv=MAX_TURNS --setenv=MAX_BUDGET --setenv=MAX_SECONDS --setenv=MAX_MINUTES --setenv=LOCK_FILE --setenv=EXIT_FILE --setenv=ERROR_FILE --setenv=OUTPUT_FILE --setenv=WRAPPER_PID_FILE --setenv=CHILD_PID_FILE --setenv=STARTED_FILE --setenv=HEARTBEAT_FILE --setenv=SNAPSHOT_FILE --setenv=RESULT_FILE --setenv=REQUESTED_STOP_FILE --setenv=HEARTBEAT_INTERVAL "$runner" >/dev/null
+    sleep 2
+    status_run --issue "$issue"
+}
+
+status_snapshot() {
+    load_state "$1"
+    local service=inactive wrapper_pid=0 child_pid=0 wrapper_alive=false child_alive=false exit_code='' state branch head dirty=false heartbeat=''
+    service="$(systemctl --user is-active "$UNIT.service" 2>/dev/null || true)"
+    [[ -f "$RUN_DIR/wrapper.pid" ]] && wrapper_pid="$(tr -d '\n' <"$RUN_DIR/wrapper.pid")"
+    [[ -f "$RUN_DIR/child.pid" ]] && child_pid="$(tr -d '\n' <"$RUN_DIR/child.pid")"
+    kill -0 "$wrapper_pid" 2>/dev/null && wrapper_alive=true || true
+    kill -0 "$child_pid" 2>/dev/null && child_alive=true || true
+    [[ -f "$RUN_DIR/exit-code" ]] && exit_code="$(tr -d '\n' <"$RUN_DIR/exit-code")"
+    [[ -f "$RUN_DIR/heartbeat" ]] && heartbeat="$(tr -d '\n' <"$RUN_DIR/heartbeat")"
+    branch="$(git -C "$WORKTREE" symbolic-ref --quiet --short HEAD 2>/dev/null || git -C "$WORKTREE" rev-parse --short HEAD 2>/dev/null || true)"
+    head="$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || true)"
+    [[ -n "$(git -C "$WORKTREE" status --porcelain 2>/dev/null)" ]] && dirty=true || true
+    if [[ -f "$RUN_DIR/requested-stop" ]]; then
+        if [[ "$exit_code" == 143 ]]; then state=STOPPED; else state=STOPPING; fi
+    elif [[ -n "$exit_code" ]]; then
+        case "$exit_code" in
+            0) state=COMPLETED ;;
+            124) state=TIMED_OUT ;;
+            143) state=STOPPED ;;
+            *) state=FAILED ;;
+        esac
+    elif [[ "$service" == active && "$wrapper_alive" == true && "$child_alive" == true ]]; then
+        state=RUNNING
+    else
+        state=LOST
+    fi
+    if [[ "$state" =~ ^(COMPLETED|FAILED|TIMED_OUT|STOPPED)$ ]]; then
+        service=inactive
+        wrapper_pid=0
+        wrapper_alive=false
+        child_pid=0
+        child_alive=false
+    fi
+    STATUS_STATE=$state STATUS_SERVICE=$service STATUS_WRAPPER_PID=$wrapper_pid STATUS_CHILD_PID=$child_pid STATUS_WRAPPER_ALIVE=$wrapper_alive STATUS_CHILD_ALIVE=$child_alive STATUS_EXIT_CODE=$exit_code STATUS_HEARTBEAT=$heartbeat STATUS_BRANCH=$branch STATUS_HEAD=$head STATUS_DIRTY=$dirty
+}
+
+write_result() {
+    python3 - "$RUN_DIR/result.json" "$ISSUE" "$AGENT" "$MODEL" "$STATUS_STATE" "$STATUS_SERVICE" "$STATUS_WRAPPER_PID" "$STATUS_WRAPPER_ALIVE" "$STATUS_CHILD_PID" "$STATUS_CHILD_ALIVE" "$STARTED_AT" "$MAX_MINUTES" "$RUN_DIR" "$STATUS_EXIT_CODE" "$STATUS_HEARTBEAT" "$WORKTREE" "$STATUS_BRANCH" "$STATUS_HEAD" "$STATUS_DIRTY" "$RUN_DIR/output.log" "$RUN_DIR/stderr.log" "$RUN_DIR/snapshot.txt" <<'PY'
+import json, os, sys, tempfile
+p, issue, agent, model, state, service, wp, wa, cp, ca, started, minutes, run, code, heartbeat, worktree, branch, head, dirty, output, error, snapshot = sys.argv[1:]
+terminal = state in {'COMPLETED', 'FAILED', 'TIMED_OUT', 'STOPPED'}
+d = {'state': state, 'issue': issue, 'agent': agent, 'model': model,
+     'service': 'inactive' if terminal else service,
+     'wrapper_pid': 0 if terminal else int(wp) if wp.isdigit() else 0,
+     'wrapper_alive': False if terminal else wa == 'true',
+     'child_pid': 0 if terminal else int(cp) if cp.isdigit() else 0,
+     'child_alive': False if terminal else ca == 'true', 'started_at': started,
+     'max_minutes': int(minutes), 'run_dir': run, 'exit_code': int(code) if code and code.lstrip('-').isdigit() else None,
+     'heartbeat': heartbeat or None, 'worktree': worktree, 'branch': branch, 'head': head,
+     'dirty': dirty == 'true', 'output_path': output, 'stderr_path': error, 'last_git_snapshot': snapshot}
+fd, temporary = tempfile.mkstemp(dir=os.path.dirname(p), prefix='.result.', text=True)
+with os.fdopen(fd, 'w') as f:
+    json.dump(d, f, indent=2); f.write('\n')
+os.chmod(temporary, 0o600); os.replace(temporary, p)
+PY
+}
+
+status_run() {
+    local issue='' json=false
+    while (($#)); do
+        case "$1" in
+            --issue) issue="$2"; shift 2 ;;
+            --json) json=true; shift ;;
+            *) die "Unknown status argument: $1" ;;
+        esac
+    done
+    [[ -n "$issue" ]] || die 'status requires --issue'
+    status_snapshot "$issue"
+    if [[ "$STATUS_STATE" =~ ^(COMPLETED|FAILED|TIMED_OUT|STOPPED)$ ]]; then
+        write_result
+    fi
+    if [[ "$json" == true ]]; then
+        python3 - "$ISSUE" "$AGENT" "$MODEL" "$STATUS_STATE" "$STATUS_SERVICE" "$STATUS_WRAPPER_PID" "$STATUS_WRAPPER_ALIVE" "$STATUS_CHILD_PID" "$STATUS_CHILD_ALIVE" "$STARTED_AT" "$MAX_MINUTES" "$RUN_DIR" "$STATUS_EXIT_CODE" "$STATUS_HEARTBEAT" "$WORKTREE" "$STATUS_BRANCH" "$STATUS_HEAD" "$STATUS_DIRTY" <<'PY'
+import json, sys
+a = sys.argv[1:]
+print(json.dumps({'state':a[3], 'issue':a[0], 'agent':a[1], 'model':a[2], 'service':a[4], 'wrapper_pid':int(a[5]) if a[5].isdigit() else 0, 'wrapper_alive':a[6]=='true', 'child_pid':int(a[7]) if a[7].isdigit() else 0, 'child_alive':a[8]=='true', 'started_at':a[9], 'max_minutes':int(a[10]), 'run_dir':a[11], 'exit_code':int(a[12]) if a[12] and a[12].lstrip('-').isdigit() else None, 'heartbeat':a[13] or None, 'worktree':a[14], 'branch':a[15], 'head':a[16], 'dirty':a[17]=='true'}, separators=(',',':')))
+PY
+    else
+        local wrapper_text=no child_text=no
+        [[ "$STATUS_WRAPPER_ALIVE" == true ]] && wrapper_text=yes
+        [[ "$STATUS_CHILD_ALIVE" == true ]] && child_text=yes
+        printf 'STATE=%s\nISSUE=%s\nAGENT=%s\nMODEL=%s\nSERVICE=%s\nWRAPPER_PID=%s (%s)\nCHILD_PID=%s (%s)\nSTARTED=%s\nMAX_MINUTES=%s\nRUN_DIR=%s\n' "$STATUS_STATE" "$ISSUE" "$AGENT" "$MODEL" "$STATUS_SERVICE" "$STATUS_WRAPPER_PID" "$wrapper_text" "$STATUS_CHILD_PID" "$child_text" "$STARTED_AT" "$MAX_MINUTES" "$RUN_DIR"
+        [[ -n "$STATUS_EXIT_CODE" ]] && printf 'EXIT_CODE=%s\n' "$STATUS_EXIT_CODE"
+        [[ -n "$STATUS_HEARTBEAT" ]] && printf 'HEARTBEAT=%s\n' "$STATUS_HEARTBEAT"
+        git -C "$WORKTREE" status --short --branch | sed 's/^/GIT: /'
+    fi
+    case "$STATUS_STATE" in
+        COMPLETED|RUNNING) return 0 ;;
+        STOPPING) return 1 ;;
+        FAILED|TIMED_OUT|STOPPED|LOST) return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+stop_run() {
+    local issue=''
+    while (($#)); do
+        case "$1" in
+            --issue) issue="$2"; shift 2 ;;
+            *) die "Unknown stop argument: $1" ;;
+        esac
+    done
+    [[ -n "$issue" ]] || die 'stop requires --issue'
+    load_state "$issue"
+    atomic_write "$RUN_DIR/requested-stop" "$(date -Is) STOPPING"
+    systemctl --user stop "$UNIT.service" 2>/dev/null || true
+    sleep 1
+    if [[ ! -f "$RUN_DIR/exit-code" ]]; then
+        atomic_write "$RUN_DIR/exit-code" '143'
+    fi
+    status_run --issue "$issue" || true
+}
+
+wait_run() {
+    local issue='' timeout_seconds=1800 json=false
+    while (($#)); do
+        case "$1" in
+            --issue) issue="$2"; shift 2 ;;
+            --timeout-seconds) timeout_seconds="$2"; shift 2 ;;
+            --json) json=true; shift ;;
+            *) die "Unknown wait argument: $1" ;;
+        esac
+    done
+    [[ -n "$issue" ]] || die 'wait requires --issue'
+    [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || die 'timeout-seconds must be a non-negative integer'
+    local end=$(( $(date +%s) + timeout_seconds ))
+    while (( $(date +%s) < end )); do
+        load_state "$issue"
+        status_snapshot "$issue"
+        if [[ -f "$RUN_DIR/requested-stop" && "$STATUS_SERVICE" != active && "$STATUS_EXIT_CODE" != 143 ]]; then
+            atomic_write "$RUN_DIR/exit-code" '143'
+        fi
+        if [[ "$STATUS_STATE" =~ ^(COMPLETED|FAILED|TIMED_OUT|STOPPED|LOST)$ ]]; then
+            if [[ "$json" == true ]]; then status_run --issue "$issue" --json || true; else status_run --issue "$issue" || true; fi
+            [[ "$STATUS_STATE" == COMPLETED ]] && return 0
+            return 1
+        fi
+        sleep 1
+    done
+    if [[ "$json" == true ]]; then
+        status_run --issue "$issue" --json || true
+    fi
+    return 124
+}
+
+cmd="${1:-}"
+[[ -n "$cmd" ]] || { usage; exit 2; }
+shift
+case "$cmd" in
+    prepare|run) prepare "$@" ;;
+    attach) attach "$@" ;;
+    start) start_run "$@" ;;
+    status) status_run "$@" ;;
+    stop) stop_run "$@" ;;
+    wait) wait_run "$@" ;;
+    -h|--help|help) usage ;;
+    *) usage; die "Unknown command: $cmd" ;;
+esac
