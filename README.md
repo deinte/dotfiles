@@ -10,6 +10,7 @@ Personal dotfiles for macOS, optimized for PHP/Laravel development with Valet.
 - **PHP/Laravel**: Valet-based workflow with PHP Monitor
 - **Node**: FNM (Fast Node Manager) instead of NVM
 - **Claude Code**: Skills, agents, and settings
+- **Linux dev workstation**: Reproducible task runner and workstation doctor (see [Linux dev-workstation docs](docs/dev-workstation.md))
 
 ## Quick Start
 
@@ -34,7 +35,11 @@ exec zsh
 ├── bin/
 │   ├── install         # Main installation script
 │   ├── update          # Update all packages
-│   └── php-format      # PHP formatter for Zed
+│   ├── php-format      # PHP formatter for Zed
+│   ├── agent-task      # Linux task lifecycle runner
+│   ├── install-linux-devstation
+│   ├── workstation-sync
+│   └── workstation-doctor
 ├── config/
 │   ├── Brewfile        # Homebrew packages
 │   ├── starship.toml   # Prompt configuration
@@ -130,6 +135,8 @@ Run the update script to update all packages:
 ```bash
 ~/.dotfiles/bin/update
 ```
+
+On Linux, use `bin/install-linux-devstation` and `bin/workstation-sync`; the macOS `install` and `update` scripts retain their macOS/Homebrew role and do not perform Linux package or sudo operations.
 
 This updates:
 - Dotfiles repository

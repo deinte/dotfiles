@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DRY_RUN=false
+LOCAL_CURRENT_TREE=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    --local-current-tree) LOCAL_CURRENT_TREE=true ;;
+    -h|--help) echo 'Usage: workstation-sync [--dry-run] [--local-current-tree]'; exit 0 ;;
+    *) echo "ERROR: unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd -P)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" = /* ]] || SOURCE="$SOURCE_DIR/$SOURCE"
+done
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd -P)"
+DOTFILES_ROOT="${DOTFILES_ROOT:-$SCRIPT_DIR}"
+INSTALLER="$DOTFILES_ROOT/bin/install-linux-devstation"
+[[ -x "$INSTALLER" ]] || { echo "ERROR: installer not executable: $INSTALLER" >&2; exit 1; }
+cd "$DOTFILES_ROOT"
+
+if [[ "$LOCAL_CURRENT_TREE" != true ]]; then
+  [[ -z "$(git status --porcelain)" ]] || { echo 'ERROR: dotfiles checkout is dirty; use --local-current-tree for PR testing' >&2; exit 2; }
+  if [[ "$DRY_RUN" == true ]]; then
+    echo 'DRY-RUN: git fetch origin main'
+    echo 'DRY-RUN: git merge --ff-only origin/main'
+  else
+    git fetch origin main
+    git merge --ff-only origin/main
+  fi
+else
+  echo 'Using local current dotfiles tree; no fetch or pull performed.'
+fi
+
+if [[ "$DRY_RUN" == true ]]; then
+  "$INSTALLER" --dry-run
+else
+  "$INSTALLER"
+fi
