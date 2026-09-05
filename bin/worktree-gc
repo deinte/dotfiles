@@ -1913,7 +1913,11 @@ def build_parser() -> argparse.ArgumentParser:
     collect = subparsers.add_parser("collect", help="plan removals; deletes only with --approve")
     add_shared(collect)
     collect.add_argument("--approve", action="store_true",
-                         help="MANUAL APPROVAL: actually run git worktree remove on eligible worktrees")
+                         help="MANUAL APPROVAL: actually run git worktree remove on eligible "
+                              "worktrees. Not sufficient on its own - it supplies no cleanup "
+                              "identity, so every managed worktree also needs its task id or "
+                              "exact basename passed to --approve-task-cleanup (or listed in "
+                              "task_cleanup_approved)")
     collect.set_defaults(func=command_collect, fetch=True)
 
     check = subparsers.add_parser("inode-check", help="inode/space threshold check for monitoring")

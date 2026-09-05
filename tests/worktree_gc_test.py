@@ -1996,6 +1996,22 @@ class CliSurfaceTest(unittest.TestCase):
         proc = subprocess.run([str(SCRIPT), "--help"], capture_output=True, text=True)
         self.assertIn("--approve to delete", proc.stdout)
 
+    def test_collect_help_says_approve_alone_is_not_sufficient(self):
+        proc = subprocess.run([str(SCRIPT), "collect", "--help"], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        text = " ".join(proc.stdout.split())
+        self.assertIn("--approve-task-cleanup", text)
+        self.assertIn("Not sufficient on its own", text)
+
+    def test_docs_describe_every_gate_the_tool_can_emit(self):
+        """The operator docs must name the blockers and the flags that clear them."""
+        docs = (Path(__file__).resolve().parent.parent / "docs" / "worktree-retention.md").read_text()
+        for blocker in ("process-coverage-incomplete", "task-cleanup-not-approved",
+                        "worktree-cleanup-not-approved"):
+            self.assertIn(f"`{blocker}`", docs)
+        self.assertIn("--approve-task-cleanup", docs)
+        self.assertIn("task_cleanup_approved", docs)
+
     def test_missing_worktrees_directory_is_a_usage_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             proc = subprocess.run([str(SCRIPT), "--root", tmp, "inventory"], capture_output=True, text=True)

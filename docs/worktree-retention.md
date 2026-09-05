@@ -59,7 +59,7 @@ whole tool is built on.
 | `task-metadata-unreadable` | `artifacts/*/run.json` or `runs/*.env` could not be parsed |
 | `worktree-lock-held` | the `agent-task` per-worktree flock is held |
 | `protected-task`, `protected-worktree` | explicitly protected by config or flag |
-| `process-coverage-incomplete` | some process's `/proc` references are unknown, so "nothing is using it" is unproven |
+| `process-coverage-incomplete` | **host-wide.** Any pid whose `/proc` references could not be read leaves "nothing is using it" unproven, so *every* worktree is blocked until the read-only privileged probe covers it |
 | `process-scan-incomplete` | `strict_process_scan`: a process needed the privileged probe |
 | `process-scan-failed`, `listener-scan-failed`, `unit-scan-failed` | a host scan failed; nothing is removable until it works |
 
@@ -138,11 +138,19 @@ error (`EACCES`/`EPERM` from a non-dumpable or foreign process, `EINVAL`,
 anything else) does leave the pid uncovered. The privileged probe below makes
 the same distinction and reports `unreadable` for that pid instead of `ok`.
 
-`argv` matching is a hint, not proof: a process can hold a worktree without
-naming it on its command line. Unproven is not the same as absent, so every pid
-whose references could not be established is recorded as *uncovered* and, while
-any remain, `process-coverage-incomplete` blocks every worktree. Inventory still reports each worktree's other findings, so you can see
-what would otherwise be eligible — but nothing is removable.
+`argv` matching is a hint, not proof, and it is **not** the treatment for this
+user's own unreadable processes: a process can hold a worktree without naming it
+on its command line, so matching argv can only ever *add* an
+`in-use-by-process` blocker, never establish absence. Unproven is not the same
+as absent, so every pid whose references could not be established — own
+non-dumpable and foreign-uid alike — is recorded as *uncovered*.
+
+**One uncovered pid blocks every removal.** This is not the paranoid mode:
+`process-coverage-incomplete` fires on the plain default configuration, for all
+worktrees at once, as soon as a single pid is uncovered. (`strict_process_scan`
+is the separate, stricter setting described below, which blocks even after the
+probe succeeded.) Inventory still reports each worktree's other findings, so you
+can see what would otherwise be eligible — but nothing is removable.
 
 There is exactly one way to clear an uncovered pid: prove what it references.
 `worktree-gc` attempts a **read-only privileged probe** —
@@ -154,8 +162,25 @@ trusted when it ends with the `PROBE-OK` sentinel, every line parses, and it
 reports a definite status (`ok` or `gone`) per pid; partial output, a pid it
 listed references for but never gave a final status to, or any line that does
 not parse clears nothing. References it finds are merged into the normal
-evaluation, so a probed process holding a candidate shows up as an ordinary
-`in-use-by-process` blocker.
+evaluation, so absence becomes *candidate-specific* again: once every pid is
+covered, a probed process that holds one worktree blocks that worktree as an
+ordinary `in-use-by-process` blocker and leaves the others judged on their own
+merits.
+
+**Required privilege.** The probe must run as a uid that can read
+`/proc/<pid>/{cwd,root,exe,fd}` for non-dumpable and foreign-uid processes — in
+practice `root`. `worktree-gc` requests it only through `sudo -n`, so the host
+must grant *passwordless* sudo for it. There is no other escalation path and no
+interactive prompt.
+
+**Fail-closed fallback.** When that privilege is not available — no passwordless
+sudo, `sudo -n` refuses, the probe is switched off with
+`privileged_process_probe: false` or `--no-privileged-process-probe`, it times
+out, or its output is not fully trusted — the uncovered pids are simply not
+cleared. Nothing falls back to argv matching and nothing is assumed idle:
+`process-coverage-incomplete` stands and `collect --approve` removes nothing.
+That is the designed outcome on an unprivileged host, not a failure to work
+around.
 
 **Do not grant this with a `sudoers` rule for `python3 -c`.** A rule that lets a
 command run arbitrary inline source under `sudo` is a grant of root, not of a
@@ -186,7 +211,7 @@ Therefore a worktree with **any** task association is blocked with
 `task-cleanup-not-approved` until a human records the external decision:
 
 ```bash
-worktree-gc collect --approve-task-cleanup SPOT-123 --approve --worktree <path>
+worktree-gc collect --approve --worktree <path> --approve-task-cleanup SPOT-123
 ```
 
 An association is established three ways, and any one of them is enough:
@@ -227,7 +252,7 @@ synthesises a cleanup identity from the **exact worktree basename** and blocks
 the worktree with `worktree-cleanup-not-approved` until that name is approved:
 
 ```bash
-worktree-gc collect --approve-task-cleanup SK-123 --approve --worktree <path>
+worktree-gc collect --approve --worktree <path> --approve-task-cleanup SK-123
 ```
 
 The synthesised identity is reported in the record's `cleanup_identity` field
@@ -251,14 +276,70 @@ association is unknown or absent cannot become eligible from `--approve` alone.
 
 #### Recording the approval
 
-Every gate above is cleared the same way: `--approve-task-cleanup <name>` for one
-run, or, durably, `task_cleanup_approved` in the config file. Adding an entry
-there is an explicit assertion that you looked at the board — or, for the generic
-fallback, at what owns that directory — and it is completed or otherwise approved
-for cleanup. Approval never overrides anything else: an in-flight local run, a
-dirty tree, a held lock, `protected_worktrees`, or `protected_tasks` all still
-block, and listing the same task as both protected and cleanup-approved is a
-usage error rather than a silent precedence rule.
+Every gate above is cleared the same way, and there are exactly two places to
+record it:
+
+| Where | Scope | Blocker it clears |
+| --- | --- | --- |
+| `--approve-task-cleanup <id>` (repeatable CLI flag) | this invocation only | `task-cleanup-not-approved`, `worktree-cleanup-not-approved` |
+| `"task_cleanup_approved": [...]` in the config file | every invocation until removed by hand | the same two |
+
+The CLI flag is *merged onto* the config list for that run; it never replaces
+it. Either way the entry is an explicit assertion that you looked at the board —
+or, for the generic fallback, at what owns that directory — and that it is
+completed or otherwise approved for cleanup.
+
+Approval never overrides anything else: an in-flight local run, a dirty tree, a
+held lock, incomplete process coverage, `protected_worktrees`, or
+`protected_tasks` all still block, and listing the same task as both protected
+and cleanup-approved is a usage error rather than a silent precedence rule.
+
+**`--approve` alone is never enough.** `--approve` is permission to carry out
+removals that are *already* eligible; it supplies no identity. Every managed
+worktree also needs its cleanup identity approved, so the real one-at-a-time
+reviewed command is:
+
+```bash
+worktree-gc collect --approve --worktree <path> --approve-task-cleanup <identity>
+```
+
+- `--worktree` takes a **path** (as `--help` says: "limit to this worktree
+  path"), not a bare name. A relative value is resolved against the current
+  directory, so pass `~/agent-workstation/worktrees/<name>` to be unambiguous.
+- `<identity>` is whatever the report names for that worktree: the **task id**
+  when it has an association or an inferable `t_<hex>` name (matched by the
+  `agent-task` slug rule), or the **exact worktree basename** when it has
+  neither (matched verbatim). Read it off the record's `tasks` /
+  `cleanup_identity` fields rather than guessing which applies.
+- Both flags are repeatable, and both are needed. Dropping
+  `--approve-task-cleanup` leaves `task-cleanup-not-approved` or
+  `worktree-cleanup-not-approved` in place and the run deletes nothing.
+
+#### Approval lifecycle
+
+**Prefer the one-shot CLI flag.** `--approve-task-cleanup` expires with the
+process, which matches what the approval actually is: a decision about one
+worktree, checked once, acted on immediately. Use it for the per-worktree
+rollout below.
+
+**A config entry outlives the worktree it was written for.** Nothing in the tool
+removes an entry from `task_cleanup_approved` after a successful removal — the
+config file is only ever read. So a `task_cleanup_approved` entry naming
+`SK-123` or `t_35c15c8a` keeps matching after that worktree is gone, and if a
+worktree with the **same name** is later recreated for new, unfinished work, it
+starts life already past its cleanup gate. The stale authorisation is inherited
+silently; the report will show the gate as satisfied without anyone having
+looked at the board again.
+
+So, when you do use a durable config approval:
+
+1. Add the entry, run the removal, and confirm it succeeded.
+2. **Delete the entry from `task_cleanup_approved` immediately afterwards.**
+   Treat it as spent, not as standing permission.
+3. Re-add it deliberately if the same identity ever needs approving again.
+
+The list should read as "approvals in flight right now", and on a quiet
+workstation it should normally be empty.
 
 Task ids (gates 1 and 2) are matched with the `agent-task` slug rule, so
 `SPOT-123`, `spot-123`, and `spot_123` are the same task. Basename fallback
@@ -274,9 +355,13 @@ worktree-gc inventory --verbose --measure all
 worktree-gc inventory --fetch                # refresh origin refs before judging reachability
 worktree-gc inventory --json                 # machine-readable report
 worktree-gc collect                          # print the removal plan, delete nothing
-worktree-gc collect --approve                # HUMAN-APPROVED removal
+worktree-gc collect --approve --worktree <path> --approve-task-cleanup <identity>
+                                             # HUMAN-APPROVED removal of one reviewed worktree
 worktree-gc inode-check                      # monitoring check
 ```
+
+`--approve` by itself removes nothing that is still missing a cleanup identity;
+see [Recording the approval](#recording-the-approval).
 
 Useful flags: `--min-age-days`, `--protect-worktree`, `--protect-task`,
 `--protect-ignored-glob`, `--approve-task-cleanup`, `--worktree` (limit to one
@@ -339,10 +424,16 @@ worktrees, including worktrees associated only by name (`t_35c15c8a`,
 on their exact basename (`SK-123`, `payments-spike`). Each entry means *a human
 checked the board — or checked what owns that directory — and this is completed
 or approved for cleanup*. Anything not listed — active, in review,
-blocked, or simply unknown — stays blocked. Keep the list short and prune it:
-it is a record of decisions already made, not a standing permission. A task may
+blocked, or simply unknown — stays blocked. A task may
 not appear in both `task_cleanup_approved` and `protected_tasks`; that is
 rejected as a usage error.
+
+Entries here are durable and are never cleaned up by the tool, so an approval
+left behind will also cover a *different*, unfinished worktree that is later
+created with the same name. Prefer the one-shot `--approve-task-cleanup` flag,
+and delete any entry you do add as soon as the removal it authorised has
+succeeded — see [Approval lifecycle](#approval-lifecycle). The list is a record
+of approvals in flight, not a standing permission.
 
 `privileged_process_probe` controls whether the read-only `sudo -n` probe of
 uninspectable pids is attempted at all. With it off (or with no passwordless
@@ -452,9 +543,25 @@ read-only:
 2. **Then — plan.** Run `collect` (no `--approve`) and check the plan against
    what you know is in use. Add anything questionable to `protected_worktrees`
    or `protected_tasks`.
-3. **Only then — approve, one at a time.** For a single reviewed worktree,
-   check its task on the board, then run
-   `collect --approve --worktree <one path> --approve-task-cleanup <ISSUE>`.
+3. **Only then — approve, one at a time.** For a single reviewed worktree, read
+   its record to see which cleanup identity applies (`tasks` / `inferred_task`
+   for a task id, `cleanup_identity` for a basename fallback), check that task
+   on the board — or check what owns that directory — then run:
+
+   ```bash
+   worktree-gc collect --approve \
+     --worktree ~/agent-workstation/worktrees/<name> \
+     --approve-task-cleanup <task-id-or-worktree-basename>
+   ```
+
+   Both flags are required. `--approve` on its own only permits removals that
+   are already eligible; without `--approve-task-cleanup` naming the right
+   identity, the worktree stays blocked on `task-cleanup-not-approved` or
+   `worktree-cleanup-not-approved` and nothing is deleted. Prefer this one-shot
+   flag over a `task_cleanup_approved` config entry; if you used a config entry,
+   remove it once the removal succeeds (see
+   [Approval lifecycle](#approval-lifecycle)).
+
    Confirm the branch still exists in the owning repo, and repeat. The estimated
    tree size and the observed free-space delta are printed per removal.
 4. **Bulk removal stays a human decision.** A full `collect --approve` is
@@ -495,7 +602,10 @@ is added to the built-in patterns, so doing so can only widen protection.
   bulk, and each one needs its own checked, exact approval.
 - **`task_cleanup_approved` is a human assertion, not a live query.** This tool
   does not talk to the board, so an entry that was true last week is still
-  trusted today. Prune the list rather than letting it accumulate.
+  trusted today, and it is matched by identity rather than by worktree instance:
+  a stale entry silently pre-approves a *new* worktree recreated under the same
+  name. Prefer one-shot `--approve-task-cleanup` flags, and delete config
+  entries once spent.
 - **Process coverage depends on a privileged probe that has no safe enabler
   yet.** Without one, coverage on a normal Linux host is never complete and
   `collect --approve` will remove nothing. Enabling it via a broad `sudoers`

@@ -53,18 +53,38 @@ an explicit manual approval flag, removes stale ones:
 ```bash
 worktree-gc                    # read-only inventory (default command)
 worktree-gc collect            # removal plan only; deletes nothing
-worktree-gc collect --approve  # human-approved removal, plain `git worktree remove`
 worktree-gc inode-check        # 0 ok, 1 warn, 2 critical, 3 unknown
+
+# human-approved removal of one reviewed worktree; both flags are required
+worktree-gc collect --approve \
+  --worktree ~/agent-workstation/worktrees/<name> \
+  --approve-task-cleanup <task-id-or-worktree-basename>
 ```
 
 Every safety predicate fails closed, local branches and commits are preserved,
-and `--approve` must never be scheduled. Three gates in particular are strict:
-a worktree stays blocked while any process's `/proc` references are unreadable,
-a task-associated worktree needs its external board state recorded in
-`task_cleanup_approved` — including a worktree associated only by being named
-after a Kanban task (`t_35c15c8a`, `t_3626513e-revert`), whose local metadata
-may be missing entirely — and `collect --approve` holds the `agent-task`
-per-worktree flock from the final check until after `git worktree remove`. See
+and `--approve` must never be scheduled. `--approve` alone is not enough to
+delete anything: it permits removals that are already eligible but supplies no
+cleanup identity, which `--approve-task-cleanup` (or the durable
+`task_cleanup_approved` config key) must do separately. Four gates in particular
+are strict:
+
+- **process coverage** — a single pid whose `/proc` references are unreadable
+  blocks *every* worktree with `process-coverage-incomplete`, on the default
+  configuration. Only a read-only privileged probe (`sudo -n`, so passwordless
+  sudo is required) can clear it; with no such privilege, nothing is removable;
+- **task-associated worktrees** need their external board state recorded, which
+  includes a worktree associated only by being named after a Kanban task
+  (`t_35c15c8a`, `t_3626513e-revert`) whose local metadata may be missing
+  entirely;
+- **every other managed worktree** (`SPOT-123`, `payments-spike`) is gated on its
+  exact basename with `worktree-cleanup-not-approved`, so nothing falls through
+  for lack of metadata;
+- **the removal lock** — `collect --approve` holds the `agent-task` per-worktree
+  flock from the final check until after `git worktree remove`.
+
+Prefer the one-shot `--approve-task-cleanup` flag over a config entry, and
+delete any config entry once the removal it authorised succeeded — otherwise a
+worktree later recreated with the same name inherits the stale approval. See
 [Worktree retention and inode pressure](worktree-retention.md) for the full
 blocker list, configuration, monitoring setup, and rollout policy.
 
