@@ -7,7 +7,7 @@ closed: when a fact cannot be established the worktree is blocked, never
 removed.
 
 Commands
-  inventory     read-only eligibility/blocker report with projected reclaim
+  inventory     read-only eligibility/blocker report with estimated reclaim
   collect       plan removals; deletes only with --approve
   inode-check   filesystem inode/space alert suitable for monitoring
 
@@ -95,6 +95,11 @@ def human_bytes(count: int) -> str:
             return f"{step:.1f}{unit}" if unit != "B" else f"{int(step)}B"
         step /= 1024
     return f"{step:.1f}TiB"
+
+
+def signed_bytes(count: int) -> str:
+    """human_bytes that keeps the sign, so negative deltas stay visible."""
+    return f"-{human_bytes(-count)}" if count < 0 else human_bytes(count)
 
 
 def run_command(args, timeout=GIT_TIMEOUT, cwd=None):
@@ -746,6 +751,25 @@ def measure_tree(path: str) -> tuple[int, int, list]:
     return inodes, total_bytes, errors
 
 
+def fs_free_snapshot(path: str) -> tuple[dict | None, str]:
+    """Free inodes/bytes of the filesystem holding `path`, from statvfs.
+
+    f_ffree is the free inode count and f_bavail the blocks available to this
+    (unprivileged) user, so the byte figure excludes root-reserved space.
+    """
+    try:
+        stat = os.statvfs(path)
+    except OSError as exc:
+        return None, str(exc)
+    return {"free_inodes": stat.f_ffree, "free_bytes": stat.f_bavail * stat.f_frsize}, ""
+
+
+def snapshot_anchor(path: str) -> str:
+    """Stable path to statvfs: the worktree's parent, which outlives removal."""
+    parent = os.path.dirname(os.path.abspath(path).rstrip("/"))
+    return parent or "/"
+
+
 def newest_mtime(path: str) -> float:
     """Newest mtime among the worktree dir and its immediate children."""
     newest = 0.0
@@ -1116,8 +1140,8 @@ def print_report(report: dict, verbose: bool) -> None:
         f"Total: {summary['total']}  eligible: {summary['eligible']}  blocked: {summary['blocked']}"
     )
     print(
-        f"Projected reclaim: {summary['projected_inodes']} inodes, "
-        f"{human_bytes(summary['projected_bytes'])}"
+        f"Projected reclaim (ESTIMATE from measured tree size): "
+        f"{summary['projected_inodes']} inodes, {human_bytes(summary['projected_bytes'])}"
     )
     print("No worktree was modified. Removal requires: worktree-gc collect --approve")
 
@@ -1176,23 +1200,92 @@ def command_collect(args) -> int:
             failed.append((path, "recheck blocked: " + recheck_blockers[0]["code"]))
             print(f"SKIP {path}: recheck blocked ({recheck_blockers[0]['code']})")
             continue
-        inodes, size, _ = measure_tree(path)
+        # Pre-removal tree measurement is an ESTIMATE of what removal should
+        # free. The observed figures below come from statvfs snapshots taken
+        # immediately before and after `git worktree remove`.
+        estimated_inodes, estimated_bytes, _ = measure_tree(path)
+        anchor = snapshot_anchor(path)
+        before, before_error = fs_free_snapshot(anchor)
         ok, error = remove_worktree(record["main_repo"], path)
-        if ok:
-            removed.append({"path": path, "inodes": inodes, "bytes": size, "branch": record["branch"]})
-            print(f"REMOVED {path}  reclaimed {inodes} inodes, {human_bytes(size)} (branch {record['branch'] or '-'} kept)")
-        else:
+        after, after_error = fs_free_snapshot(anchor) if ok else (None, "")
+        if not ok:
             failed.append((path, error))
             print(f"FAILED {path}: {error}")
+            continue
 
-    total_inodes = sum(item["inodes"] for item in removed)
-    total_bytes = sum(item["bytes"] for item in removed)
+        entry = {
+            "path": path,
+            "branch": record["branch"],
+            "estimated_inodes": estimated_inodes,
+            "estimated_bytes": estimated_bytes,
+            "observed_free_inode_delta": None,
+            "observed_free_bytes_delta": None,
+            "observed_error": "",
+            "statvfs_anchor": anchor,
+        }
+        if before and after:
+            # Raw deltas, never clamped: a negative value means concurrent
+            # filesystem activity allocated more than this removal freed.
+            entry["observed_free_inode_delta"] = after["free_inodes"] - before["free_inodes"]
+            entry["observed_free_bytes_delta"] = after["free_bytes"] - before["free_bytes"]
+        else:
+            entry["observed_error"] = before_error or after_error or "statvfs unavailable"
+        removed.append(entry)
+
+        observed = (
+            f"observed free-space delta {entry['observed_free_inode_delta']} inodes, "
+            f"{signed_bytes(entry['observed_free_bytes_delta'])}"
+            if entry["observed_free_inode_delta"] is not None
+            else f"observed delta unavailable ({entry['observed_error']})"
+        )
+        print(
+            f"REMOVED {path}  estimated tree {estimated_inodes} inodes, "
+            f"{human_bytes(estimated_bytes)}; {observed} "
+            f"(branch {record['branch'] or '-'} kept)"
+        )
+
+    total_estimated_inodes = sum(item["estimated_inodes"] for item in removed)
+    total_estimated_bytes = sum(item["estimated_bytes"] for item in removed)
+    observed_entries = [item for item in removed if item["observed_free_inode_delta"] is not None]
+    observed_inode_delta = sum(item["observed_free_inode_delta"] for item in observed_entries)
+    observed_bytes_delta = sum(item["observed_free_bytes_delta"] for item in observed_entries)
+    unobserved = len(removed) - len(observed_entries)
+
     print("")
-    print(f"Removed {len(removed)} worktree(s); reclaimed {total_inodes} inodes, {human_bytes(total_bytes)}")
+    print(
+        f"Removed {len(removed)} worktree(s); estimated tree size "
+        f"{total_estimated_inodes} inodes, {human_bytes(total_estimated_bytes)}"
+    )
+    print(
+        f"Observed free-space delta (statvfs f_ffree/f_bavail, {len(observed_entries)}"
+        f"/{len(removed)} removals sampled): {observed_inode_delta} inodes, "
+        f"{signed_bytes(observed_bytes_delta)}"
+    )
+    if unobserved:
+        print(f"NOTE: {unobserved} removal(s) had no usable statvfs sample; excluded from the observed totals")
+    print(
+        "NOTE: estimates are pre-removal tree measurements, not reclaim. Observed deltas are "
+        "whole-filesystem and include any concurrent activity, so they may under- or overstate "
+        "this run's reclaim and can be negative."
+    )
     print(f"Failed/skipped: {len(failed)}")
     if args.json:
-        print(json.dumps({"removed": removed, "failed": [{"path": p, "error": e} for p, e in failed],
-                          "reclaimed_inodes": total_inodes, "reclaimed_bytes": total_bytes}, indent=2))
+        print(json.dumps({
+            "removed": removed,
+            "failed": [{"path": p, "error": e} for p, e in failed],
+            "estimated_inodes": total_estimated_inodes,
+            "estimated_bytes": total_estimated_bytes,
+            "observed_free_inode_delta": observed_inode_delta,
+            "observed_free_bytes_delta": observed_bytes_delta,
+            "observed_samples": len(observed_entries),
+            "observed_unavailable": unobserved,
+            "observed_delta_caveat": (
+                "Observed deltas are filesystem-wide statvfs differences (f_ffree / "
+                "f_bavail * f_frsize) taken immediately before and after each git worktree "
+                "remove. Concurrent filesystem activity is included; values are reported raw "
+                "and may be negative."
+            ),
+        }, indent=2))
     return EXIT_FAILURE if failed else EXIT_OK
 
 

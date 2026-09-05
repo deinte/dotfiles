@@ -103,6 +103,27 @@ class MeasureTreeTest(unittest.TestCase):
         self.assertTrue(errors)
 
 
+class FreeSpaceSnapshotTest(unittest.TestCase):
+    def test_snapshot_reports_statvfs_free_inodes_and_available_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot, error = gc.fs_free_snapshot(tmp)
+            self.assertEqual(error, "")
+            raw = os.statvfs(tmp)
+            self.assertEqual(snapshot["free_inodes"], raw.f_ffree)
+            # f_bavail (not f_bfree): bytes available to this unprivileged user.
+            self.assertEqual(snapshot["free_bytes"], raw.f_bavail * raw.f_frsize)
+
+    def test_snapshot_missing_path_reports_error(self):
+        snapshot, error = gc.fs_free_snapshot("/nonexistent-worktree-gc-path")
+        self.assertIsNone(snapshot)
+        self.assertTrue(error)
+
+    def test_anchor_is_the_parent_that_survives_removal(self):
+        self.assertEqual(gc.snapshot_anchor("/a/b/c"), "/a/b")
+        self.assertEqual(gc.snapshot_anchor("/a/b/c/"), "/a/b")
+        self.assertEqual(gc.snapshot_anchor("/a"), "/")
+
+
 class ProcessScanTest(unittest.TestCase):
     def _fake_proc(self, tmp, pid, cwd=None, fds=None):
         pid_dir = Path(tmp) / str(pid)
@@ -602,16 +623,96 @@ class EndToEndTest(unittest.TestCase):
         self.assertFalse(clean.exists(), text)
         self.assertTrue(dirty.is_dir())
         self.assertIn("REMOVED", text)
-        self.assertRegex(text, r"reclaimed \d+ inodes")
+        self.assertRegex(text, r"estimated tree \d+ inodes")
+        self.assertRegex(text, r"observed free-space delta -?\d+ inodes")
 
-    def test_collect_reports_actual_reclaimed_counts(self):
-        self.fixture.add_worktree("clean", "feature/clean")
-        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve", "--json")
-        self.assertEqual(code, 0, text)
+    def _collect_json(self, *extra):
+        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve", "--json", *extra)
         payload = json.loads(text[text.index("{", text.index("Failed/skipped")):])
+        return code, text, payload
+
+    def test_collect_separates_estimates_from_observed_deltas(self):
+        self.fixture.add_worktree("clean", "feature/clean")
+        code, text, payload = self._collect_json()
+        self.assertEqual(code, 0, text)
         self.assertEqual(len(payload["removed"]), 1)
-        self.assertGreater(payload["reclaimed_inodes"], 0)
-        self.assertGreater(payload["reclaimed_bytes"], 0)
+        # Pre-removal measurement is an estimate and is labelled as one.
+        self.assertGreater(payload["estimated_inodes"], 0)
+        self.assertGreater(payload["estimated_bytes"], 0)
+        self.assertNotIn("reclaimed_inodes", payload)
+        self.assertNotIn("reclaimed_bytes", payload)
+        self.assertEqual(payload["observed_samples"], 1)
+        self.assertEqual(payload["observed_unavailable"], 0)
+        self.assertIn("f_ffree", payload["observed_delta_caveat"])
+        self.assertIn("f_bavail", payload["observed_delta_caveat"])
+
+    def test_observed_delta_is_the_difference_of_statvfs_snapshots(self):
+        """Observed values must come from before/after statvfs, not the measurement."""
+        self.fixture.add_worktree("clean", "feature/clean")
+        saved = gc.fs_free_snapshot
+        samples = [
+            ({"free_inodes": 1_000, "free_bytes": 8_000}, ""),   # before
+            ({"free_inodes": 1_007, "free_bytes": 9_024}, ""),   # after
+        ]
+        calls = []
+
+        def fake_snapshot(path):
+            calls.append(path)
+            return samples[min(len(calls) - 1, len(samples) - 1)]
+
+        gc.fs_free_snapshot = fake_snapshot
+        self.addCleanup(lambda: setattr(gc, "fs_free_snapshot", saved))
+        code, text, payload = self._collect_json()
+        self.assertEqual(code, 0, text)
+        entry = payload["removed"][0]
+        self.assertEqual(entry["observed_free_inode_delta"], 7)     # 1007 - 1000
+        self.assertEqual(entry["observed_free_bytes_delta"], 1_024)  # 9024 - 8000
+        self.assertEqual(payload["observed_free_inode_delta"], 7)
+        self.assertEqual(payload["observed_free_bytes_delta"], 1_024)
+        # ...and they are independent of the (much larger) tree estimate.
+        self.assertNotEqual(entry["estimated_inodes"], 7)
+        # Both snapshots target the same surviving anchor path.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.assertTrue(os.path.isdir(calls[0]))
+
+    def test_negative_observed_delta_is_preserved_not_clamped(self):
+        """Concurrent allocation can outweigh reclaim; do not fabricate a positive."""
+        self.fixture.add_worktree("clean", "feature/clean")
+        saved = gc.fs_free_snapshot
+        samples = [
+            ({"free_inodes": 1_000, "free_bytes": 8_000}, ""),
+            ({"free_inodes": 996, "free_bytes": 5_952}, ""),
+        ]
+        calls = []
+
+        def fake_snapshot(path):
+            calls.append(path)
+            return samples[min(len(calls) - 1, len(samples) - 1)]
+
+        gc.fs_free_snapshot = fake_snapshot
+        self.addCleanup(lambda: setattr(gc, "fs_free_snapshot", saved))
+        code, text, payload = self._collect_json()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(payload["observed_free_inode_delta"], -4)
+        self.assertEqual(payload["observed_free_bytes_delta"], -2_048)
+        self.assertIn("-4 inodes", text)
+        self.assertIn("-2.0KiB", text)
+
+    def test_unavailable_statvfs_sample_is_reported_not_guessed(self):
+        self.fixture.add_worktree("clean", "feature/clean")
+        saved = gc.fs_free_snapshot
+        gc.fs_free_snapshot = lambda path: (None, "statvfs boom")
+        self.addCleanup(lambda: setattr(gc, "fs_free_snapshot", saved))
+        code, text, payload = self._collect_json()
+        self.assertEqual(code, 0, text)
+        entry = payload["removed"][0]
+        self.assertIsNone(entry["observed_free_inode_delta"])
+        self.assertIsNone(entry["observed_free_bytes_delta"])
+        self.assertEqual(entry["observed_error"], "statvfs boom")
+        self.assertEqual(payload["observed_samples"], 0)
+        self.assertEqual(payload["observed_unavailable"], 1)
+        self.assertIn("observed delta unavailable", text)
 
     def test_collect_preserves_branch_and_commits(self):
         self.fixture.add_worktree("merged", "feature/merged", merged=True, commit=True)

@@ -90,8 +90,29 @@ Useful flags: `--min-age-days`, `--protect-worktree`, `--protect-task`,
 none|eligible|all`, `--root`, `--config`.
 
 The report lists per-worktree eligibility, every blocker, and the projected
-inode/byte reclaim. After an approved run it prints the actual reclaimed inode
-and byte counts per worktree and in total.
+inode/byte reclaim. That projection is an **estimate**: it is a pre-removal walk
+of the tree (inode count and allocated bytes, hardlinks counted once), not an
+observation of anything that was freed.
+
+After an approved run, each removal reports two distinct numbers:
+
+- **Estimated tree size** — the same pre-removal measurement, labelled as an
+  estimate (`estimated_inodes` / `estimated_bytes` in `--json`).
+- **Observed free-space delta** — `os.statvfs` snapshots taken immediately
+  before and immediately after each `git worktree remove`, differenced
+  (`observed_free_inode_delta` / `observed_free_bytes_delta`). Free inodes come
+  from `f_ffree`; free bytes from `f_bavail * f_frsize`, i.e. space available to
+  this unprivileged user, excluding root-reserved blocks.
+
+The two are aggregated separately and never conflated. Read the observed delta
+honestly: it is filesystem-wide, so anything else writing to or deleting from
+the same filesystem during the removal window is included in it. It can
+therefore understate or overstate the reclaim attributable to this run, and it
+can be **negative** when concurrent allocation outweighs the reclaim. Negative
+values are printed and stored raw — never clamped to zero and never replaced by
+the estimate. If `statvfs` cannot be sampled, the observed delta is reported as
+unavailable (with the error) and that removal is excluded from the observed
+totals rather than being backfilled from the estimate.
 
 Measurement defaults to `eligible` because walking every worktree is itself
 expensive on a loaded filesystem; use `--measure all` when you want the full
@@ -200,8 +221,9 @@ read-only:
    or `protected_tasks`.
 3. **Only then — approve, one at a time.** Run
    `collect --approve --worktree <one path>` for a single reviewed worktree,
-   confirm the branch still exists in the owning repo, and repeat. Reclaimed
-   inode counts are printed per removal.
+   confirm the branch still exists in the owning repo, and repeat. The
+   estimated tree size and the observed free-space delta are printed per
+   removal.
 4. **Bulk removal stays a human decision.** A full `collect --approve` is
    acceptable only after step 3 has been exercised enough to trust the
    predicates on this host, and only when a person is watching it run.
