@@ -84,6 +84,24 @@ class PurePredicateTest(unittest.TestCase):
                      "antwerpexpats-v2-t_92fe2b77", "t-b3824a2f-di", "t_", "t_zzzz", "tasks"):
             self.assertEqual(gc.task_id_from_worktree_name(name), "", name)
 
+    def test_merge_globs_is_additive_and_deduplicates(self):
+        self.assertEqual(gc.merge_globs([".env"], ["*.pem", ".env"]), [".env", "*.pem"])
+        self.assertEqual(gc.merge_globs([".env"], []), [".env"])
+        self.assertEqual(gc.merge_globs([".env"], None), [".env"])
+        # Built-ins come first and survive every later group.
+        merged = gc.merge_globs(gc.DEFAULTS["protected_ignored_globs"], [], ["*.pem"])
+        for builtin in gc.DEFAULTS["protected_ignored_globs"]:
+            self.assertIn(builtin, merged)
+        self.assertIn("*.pem", merged)
+
+    def test_cleanup_name_approvals_are_matched_verbatim(self):
+        config = gc.Config(root=Path("/tmp"), task_cleanup_approved=["SK-123", " SAL-45 "])
+        self.assertEqual(config.approved_cleanup_names, {"SK-123", "SAL-45"})
+        # Not slug-folded: a directory name is compared exactly, so neither a
+        # case variant nor a prefix of an approval is covered by it.
+        for name in ("sk-123", "SK-12", "SK-1234", "sk_123"):
+            self.assertNotIn(name, config.approved_cleanup_names, name)
+
     def test_path_contains(self):
         self.assertTrue(gc.path_contains("/a/b", "/a/b"))
         self.assertTrue(gc.path_contains("/a/b", "/a/b/c"))
@@ -912,7 +930,9 @@ class EndToEndTest(unittest.TestCase):
 
     def test_clean_merged_old_worktree_is_eligible(self):
         self.fixture.add_worktree("clean", "feature/clean")
-        report = self.report()
+        # No association and no inferable task id, so the basename is the
+        # cleanup identity and has to be approved before anything else counts.
+        report = self.report("--approve-task-cleanup", "clean")
         self.assertEqual(self.blockers(report, "clean"), set())
         self.assertTrue(self.record(report, "clean")["eligible"])
         self.assertGreater(report["summary"]["projected_inodes"], 0)
@@ -933,7 +953,7 @@ class EndToEndTest(unittest.TestCase):
         path = self.fixture.add_worktree("built", "feature/built")
         (path / "node_modules" / "pkg").mkdir(parents=True)
         (path / "node_modules" / "pkg" / "index.js").write_text("//")
-        report = self.report()
+        report = self.report("--approve-task-cleanup", "built")
         self.assertEqual(self.blockers(report, "built"), set())
 
     def test_ignored_env_file_blocks(self):
@@ -946,13 +966,54 @@ class EndToEndTest(unittest.TestCase):
         (path / "database.sqlite").write_text("")
         self.assertIn("protected-ignored-state", self.blockers(self.report(), "db"))
 
+    # --- built-in ignored-state protection is an invariant, not a default --
+    # `protected_ignored_globs` in the config file ADDS to the built-ins. An
+    # empty or narrowed list must not expose credentials or databases.
+
+    def test_empty_ignored_glob_config_cannot_disable_the_builtins(self):
+        path = self.fixture.add_worktree("secrets", "feature/secrets")
+        (path / ".env").write_text("APP_KEY=x")
+        (self.fixture.root / "config" / "worktree-gc.json").write_text(
+            json.dumps({"protected_ignored_globs": []})
+        )
+        report = self.report("--approve-task-cleanup", "secrets")
+        self.assertIn("protected-ignored-state", self.blockers(report, "secrets"))
+
+    def test_custom_ignored_glob_config_cannot_disable_the_builtins(self):
+        db = self.fixture.add_worktree("db", "feature/db")
+        (db / "database.sqlite").write_text("")
+        (self.fixture.root / "config" / "worktree-gc.json").write_text(
+            json.dumps({"protected_ignored_globs": ["*.pem"]})
+        )
+        report = self.report("--approve-task-cleanup", "db")
+        self.assertIn("protected-ignored-state", self.blockers(report, "db"))
+
+    def test_custom_ignored_globs_still_add_protection(self):
+        path = self.fixture.add_worktree("certs", "feature/certs")
+        (path / ".gitignore").write_text("local.pem\n")
+        run_git("add", "-A", cwd=path)
+        run_git("commit", "-qm", "ignore pem", cwd=path)
+        (path / "local.pem").write_text("-----BEGIN PRIVATE KEY-----")
+        # Not built-in: without the custom glob this is ordinary ignored output.
+        self.assertNotIn(
+            "protected-ignored-state",
+            self.blockers(self.report("--approve-task-cleanup", "certs"), "certs"),
+        )
+        (self.fixture.root / "config" / "worktree-gc.json").write_text(
+            json.dumps({"protected_ignored_globs": ["*.pem"]})
+        )
+        report = self.report("--approve-task-cleanup", "certs")
+        self.assertIn("protected-ignored-state", self.blockers(report, "certs"))
+
     def test_unmerged_commit_blocks(self):
         self.fixture.add_worktree("ahead", "feature/ahead", merged=False, commit=True)
         self.assertIn("not-merged", self.blockers(self.report(), "ahead"))
 
     def test_merged_commit_is_eligible(self):
         self.fixture.add_worktree("merged", "feature/merged", merged=True, commit=True)
-        self.assertEqual(self.blockers(self.report(), "merged"), set())
+        self.assertEqual(
+            self.blockers(self.report("--approve-task-cleanup", "merged"), "merged"), set()
+        )
 
     def test_min_age_blocks_recent_worktrees(self):
         self.fixture.add_worktree("fresh", "feature/fresh")
@@ -1150,12 +1211,104 @@ class EndToEndTest(unittest.TestCase):
         )
         self.assertIn("protected-task", self.blockers(json.loads(text), "t_3626513e-revert"))
 
-    def test_unrecognised_worktree_name_keeps_the_manual_review_path(self):
-        """Documented boundary: names that only contain a task id are not inferred."""
+    def test_unrecognised_worktree_name_is_gated_on_its_own_basename(self):
+        """Documented boundary: names that only contain a task id are not inferred.
+
+        Inference stays narrow, but the worktree does not fall out of the gate:
+        with no association and no inferable task id, the basename itself is the
+        cleanup identity and must be approved verbatim.
+        """
         self.fixture.add_worktree("marvino-demo-t_93841552", "feature/marvino")
         report = self.report()
-        self.assertEqual(self.record(report, "marvino-demo-t_93841552")["inferred_task"], "")
-        self.assertEqual(self.blockers(report, "marvino-demo-t_93841552"), set())
+        record = self.record(report, "marvino-demo-t_93841552")
+        self.assertEqual(record["inferred_task"], "")
+        self.assertEqual(record["cleanup_identity"], "marvino-demo-t_93841552")
+        self.assertEqual(
+            self.blockers(report, "marvino-demo-t_93841552"), {"worktree-cleanup-not-approved"}
+        )
+
+    # --- worktrees with no association and no inferable task id ----------
+    # Real agent-task names are not only `t_<hex>`: `SK-123`, `SPOT-123`,
+    # `SAL-45`, arbitrary task keys and plain topic names all occur, and any of
+    # them can be missing artifacts/runs metadata. None of them may lose the
+    # external-state gate; the basename becomes the cleanup identity instead.
+
+    def test_task_key_worktree_without_metadata_is_blocked(self):
+        self.fixture.add_worktree("SK-123", "feature/sk-123")
+        report = self.report()
+        record = self.record(report, "SK-123")
+        # Nothing local names this worktree, so the identity is synthesised
+        # from the basename rather than read from artifacts/runs metadata.
+        self.assertEqual(record["inferred_task"], "")
+        self.assertEqual(record["cleanup_identity"], "SK-123")
+        self.assertEqual([task["source"] for task in record["tasks"]], ["worktree-name-fallback"])
+        self.assertFalse(record["eligible"])
+        self.assertEqual(self.blockers(report, "SK-123"), {"worktree-cleanup-not-approved"})
+
+    def test_topic_named_worktree_without_metadata_is_blocked(self):
+        self.fixture.add_worktree("payments-spike", "feature/payments-spike")
+        report = self.report()
+        self.assertEqual(
+            self.blockers(report, "payments-spike"), {"worktree-cleanup-not-approved"}
+        )
+        self.assertFalse(self.record(report, "payments-spike")["eligible"])
+
+    def test_synthesised_identity_is_reported_as_the_cleanup_identity(self):
+        self.fixture.add_worktree("SPOT-999", "feature/spot-999")
+        record = self.record(self.report(), "SPOT-999")
+        self.assertEqual(record["cleanup_identity"], "SPOT-999")
+        self.assertEqual([task["issue"] for task in record["tasks"]], ["SPOT-999"])
+        self.assertEqual(record["tasks"][0]["source"], "worktree-name-fallback")
+        self.assertFalse(record["tasks"][0]["in_flight"])
+
+    def test_exact_basename_approval_unblocks_only_that_worktree(self):
+        self.fixture.add_worktree("SK-123", "feature/sk-123")
+        self.fixture.add_worktree("SAL-45", "feature/sal-45")
+        self.fixture.add_worktree("payments-spike", "feature/payments-spike")
+        report = self.report("--approve-task-cleanup", "SK-123")
+        self.assertEqual(self.blockers(report, "SK-123"), set())
+        self.assertTrue(self.record(report, "SK-123")["eligible"])
+        for name in ("SAL-45", "payments-spike"):
+            self.assertEqual(self.blockers(report, name), {"worktree-cleanup-not-approved"}, name)
+
+    def test_basename_approval_does_not_leak_across_prefix_collisions(self):
+        """Approving `SK-12` must not cover `SK-123`, and vice versa."""
+        for name in ("SK-12", "SK-123", "SK-1234"):
+            self.fixture.add_worktree(name, f"feature/{name.lower()}")
+        report = self.report("--approve-task-cleanup", "SK-12")
+        self.assertEqual(self.blockers(report, "SK-12"), set())
+        for name in ("SK-123", "SK-1234"):
+            self.assertEqual(self.blockers(report, name), {"worktree-cleanup-not-approved"}, name)
+
+    def test_config_approval_also_clears_the_synthesised_identity_gate(self):
+        self.fixture.add_worktree("SK-123", "feature/sk-123")
+        (self.fixture.root / "config" / "worktree-gc.json").write_text(
+            json.dumps({"task_cleanup_approved": ["SK-123"]})
+        )
+        self.assertEqual(self.blockers(self.report(), "SK-123"), set())
+
+    def test_collect_approve_alone_never_removes_an_unassociated_worktree(self):
+        """`--approve` authorises deletion; it never supplies the missing identity."""
+        path = self.fixture.add_worktree("SK-123", "feature/sk-123")
+        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        self.assertTrue(path.is_dir(), text)
+        self.assertIn("worktree-cleanup-not-approved", text)
+        self.assertNotIn("REMOVED", text)
+
+    def test_collect_approve_removes_only_the_exactly_approved_basename(self):
+        approved = self.fixture.add_worktree("SK-123", "feature/sk-123")
+        other = self.fixture.add_worktree("SK-1234", "feature/sk-1234")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve", "--approve-task-cleanup", "SK-123"
+        )
+        self.assertEqual(code, 0, text)
+        self.assertFalse(approved.exists(), text)
+        self.assertTrue(other.is_dir(), text)
+
+    def test_protected_worktree_still_wins_over_a_basename_approval(self):
+        self.fixture.add_worktree("SK-123", "feature/sk-123")
+        report = self.report("--approve-task-cleanup", "SK-123", "--protect-worktree", "SK-123")
+        self.assertEqual(self.blockers(report, "SK-123"), {"protected-worktree"})
 
     def test_collect_approve_refuses_a_task_named_worktree_without_approval(self):
         path = self.fixture.add_worktree("t_35c15c8a", "feature/t_35c15c8a")
@@ -1293,7 +1446,7 @@ class EndToEndTest(unittest.TestCase):
     def test_probe_proving_absence_restores_eligibility(self):
         self.fixture.add_worktree("clean", "feature/clean")
         self._uninspectable_host("REF\t4242\tcwd\t0\t/srv/elsewhere\nPID\t4242\tok\nPROBE-OK\n")
-        report = self.report()
+        report = self.report("--approve-task-cleanup", "clean")
         self.assertEqual(self.blockers(report, "clean"), set())
         self.assertTrue(report["host"]["process_coverage_complete"])
 
@@ -1335,7 +1488,9 @@ class EndToEndTest(unittest.TestCase):
 
     def test_collect_without_approve_removes_nothing(self):
         path = self.fixture.add_worktree("clean", "feature/clean")
-        code, text = self.run_cli("collect", "--min-age-days", "0")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve-task-cleanup", "clean"
+        )
         self.assertEqual(code, 0, text)
         self.assertIn("DRY-RUN", text)
         self.assertTrue(path.is_dir())
@@ -1347,7 +1502,10 @@ class EndToEndTest(unittest.TestCase):
         (clean / "node_modules").mkdir()
         (clean / "node_modules" / "a.js").write_text("//")
 
-        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve",
+            "--approve-task-cleanup", "clean", "--approve-task-cleanup", "dirty",
+        )
         self.assertEqual(code, 0, text)
         self.assertFalse(clean.exists(), text)
         self.assertTrue(dirty.is_dir())
@@ -1362,7 +1520,7 @@ class EndToEndTest(unittest.TestCase):
 
     def test_collect_separates_estimates_from_observed_deltas(self):
         self.fixture.add_worktree("clean", "feature/clean")
-        code, text, payload = self._collect_json()
+        code, text, payload = self._collect_json("--approve-task-cleanup", "clean")
         self.assertEqual(code, 0, text)
         self.assertEqual(len(payload["removed"]), 1)
         # Pre-removal measurement is an estimate and is labelled as one.
@@ -1391,7 +1549,7 @@ class EndToEndTest(unittest.TestCase):
 
         gc.fs_free_snapshot = fake_snapshot
         self.addCleanup(lambda: setattr(gc, "fs_free_snapshot", saved))
-        code, text, payload = self._collect_json()
+        code, text, payload = self._collect_json("--approve-task-cleanup", "clean")
         self.assertEqual(code, 0, text)
         entry = payload["removed"][0]
         self.assertEqual(entry["observed_free_inode_delta"], 7)     # 1007 - 1000
@@ -1421,7 +1579,7 @@ class EndToEndTest(unittest.TestCase):
 
         gc.fs_free_snapshot = fake_snapshot
         self.addCleanup(lambda: setattr(gc, "fs_free_snapshot", saved))
-        code, text, payload = self._collect_json()
+        code, text, payload = self._collect_json("--approve-task-cleanup", "clean")
         self.assertEqual(code, 0, text)
         self.assertEqual(payload["observed_free_inode_delta"], -4)
         self.assertEqual(payload["observed_free_bytes_delta"], -2_048)
@@ -1433,7 +1591,7 @@ class EndToEndTest(unittest.TestCase):
         saved = gc.fs_free_snapshot
         gc.fs_free_snapshot = lambda path: (None, "statvfs boom")
         self.addCleanup(lambda: setattr(gc, "fs_free_snapshot", saved))
-        code, text, payload = self._collect_json()
+        code, text, payload = self._collect_json("--approve-task-cleanup", "clean")
         self.assertEqual(code, 0, text)
         entry = payload["removed"][0]
         self.assertIsNone(entry["observed_free_inode_delta"])
@@ -1446,7 +1604,9 @@ class EndToEndTest(unittest.TestCase):
     def test_collect_preserves_branch_and_commits(self):
         self.fixture.add_worktree("merged", "feature/merged", merged=True, commit=True)
         head = run_git("rev-parse", "feature/merged", cwd=self.fixture.repo).strip()
-        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve", "--approve-task-cleanup", "merged"
+        )
         self.assertEqual(code, 0, text)
         self.assertEqual(run_git("rev-parse", "feature/merged", cwd=self.fixture.repo).strip(), head)
         self.assertIn("feature/merged", run_git("branch", "--list", cwd=self.fixture.repo))
@@ -1472,7 +1632,9 @@ class EndToEndTest(unittest.TestCase):
 
         gc.git_status_entries = racing_status
         self.addCleanup(lambda: setattr(gc, "git_status_entries", saved))
-        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve", "--approve-task-cleanup", "racy"
+        )
         self.assertTrue(path.is_dir(), text)
         self.assertIn("recheck blocked", text)
         self.assertEqual(code, gc.EXIT_FAILURE)
@@ -1501,7 +1663,9 @@ class EndToEndTest(unittest.TestCase):
         self.addCleanup(lambda: setattr(gc, "measure_tree", saved_measure))
         self.addCleanup(lambda: setattr(gc, "remove_worktree", saved_remove))
 
-        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve", "--approve-task-cleanup", "clean"
+        )
         self.assertEqual(code, 0, text)
         self.assertFalse(path.exists(), text)
         # No competing writer could take the lock at any point in the window...
@@ -1533,7 +1697,9 @@ class EndToEndTest(unittest.TestCase):
         gc.build_report = planning_then_a_writer_appears
         self.addCleanup(lambda: setattr(gc, "build_report", saved))
 
-        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve", "--approve-task-cleanup", "racy"
+        )
         for child in holders:
             child.stdin.close()
             child.wait(timeout=30)
@@ -1554,7 +1720,9 @@ class EndToEndTest(unittest.TestCase):
 
         gc.git = recording_git
         self.addCleanup(lambda: setattr(gc, "git", saved))
-        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve", "--approve-task-cleanup", "clean"
+        )
         self.assertFalse(path.exists(), text)
         removals = [c for c in commands if "worktree" in c and "remove" in c]
         self.assertEqual(len(removals), 1, commands)
@@ -1585,7 +1753,9 @@ class EndToEndTest(unittest.TestCase):
 
         gc.build_report = planning_then_the_remote_moves
         self.addCleanup(lambda: setattr(gc, "build_report", saved))
-        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve", "--approve-task-cleanup", "merged"
+        )
         self.assertIn("ELIGIBLE merged", text)  # the plan said yes...
         self.assertIn("recheck blocked (not-merged)", text)  # ...the refetch said no
         self.assertTrue(path.is_dir(), text)
@@ -1604,7 +1774,9 @@ class EndToEndTest(unittest.TestCase):
 
         gc.fetch_repo = fetch_then_fail
         self.addCleanup(lambda: setattr(gc, "fetch_repo", saved))
-        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve", "--approve-task-cleanup", "clean"
+        )
         self.assertIn("recheck blocked (fetch-failed)", text)
         self.assertTrue(path.is_dir(), text)
         self.assertEqual(code, gc.EXIT_FAILURE)
@@ -1621,7 +1793,9 @@ class EndToEndTest(unittest.TestCase):
         self.addCleanup(lambda: setattr(gc, "measure_tree", saved_measure))
         self.addCleanup(lambda: setattr(gc, "fetch_repo", saved_fetch))
         self.addCleanup(lambda: setattr(gc, "remove_worktree", saved_remove))
-        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve", "--approve-task-cleanup", "clean"
+        )
         self.assertEqual(code, 0, text)
         # plan fetch, plan measurement, then: measure, recheck fetch, remove.
         self.assertEqual(order[-3:], ["measure", "fetch", "remove"])
@@ -1631,7 +1805,9 @@ class EndToEndTest(unittest.TestCase):
         saved = gc.fetch_repo
         gc.fetch_repo = lambda repo: (False, "network unreachable")
         self.addCleanup(lambda: setattr(gc, "fetch_repo", saved))
-        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        code, text = self.run_cli(
+            "collect", "--min-age-days", "0", "--approve", "--approve-task-cleanup", "clean"
+        )
         self.assertIn("fetch-failed", text)
         self.assertTrue((self.fixture.root / "worktrees" / "clean").is_dir())
 

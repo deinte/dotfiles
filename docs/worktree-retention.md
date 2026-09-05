@@ -24,6 +24,12 @@ opt-in per invocation:
 Never put `--approve` in cron, a systemd timer, a doctor run, or an agent
 prompt. The rollout below defines when — if ever — that changes.
 
+`--approve` is permission to carry out removals that are *already* eligible.
+It is not an identity: every managed worktree also needs a cleanup approval
+naming the task it belongs to, or — when nothing can be resolved to a task —
+naming its exact directory. See
+[Task lifecycle is external](#task-lifecycle-is-external-and-unknown-means-blocked).
+
 ## What makes a worktree eligible
 
 A worktree is eligible only when **every** check below passes. Any check that
@@ -49,6 +55,7 @@ whole tool is built on.
 | `systemd-unit-associated` | any user unit — running or merely defined on disk — references the path |
 | `task-in-flight` | an `agent-task` run for it has no terminal `result.json` |
 | `task-cleanup-not-approved` | a task is associated — by local metadata, or by the worktree being named after it — but its **external** (board) state was never confirmed complete |
+| `worktree-cleanup-not-approved` | no association and no inferable task id, so the worktree's own basename is the cleanup identity and it was never approved |
 | `task-metadata-unreadable` | `artifacts/*/run.json` or `runs/*.env` could not be parsed |
 | `worktree-lock-held` | the `agent-task` per-worktree flock is held |
 | `protected-task`, `protected-worktree` | explicitly protected by config or flag |
@@ -58,7 +65,9 @@ whole tool is built on.
 
 Build output (`vendor/`, `node_modules/`, `public/build/`) is deliberately *not*
 a blocker — reclaiming it is the point. Local credentials and databases are,
-via `protected_ignored_globs`.
+via `protected_ignored_globs`, whose built-in patterns are a safety invariant
+that configuration can extend but never switch off (see
+[Ignored-state protection is additive](#ignored-state-protection-is-additive)).
 
 Removal preserves local branches and commits: `git worktree remove` deletes the
 checkout directory and the worktree registration only. The branch and every
@@ -180,16 +189,20 @@ Therefore a worktree with **any** task association is blocked with
 worktree-gc collect --approve-task-cleanup SPOT-123 --approve --worktree <path>
 ```
 
-An association is established two ways, and either one is enough:
+An association is established three ways, and any one of them is enough:
 
-1. **Local metadata** — `artifacts/*/run.json` or `runs/*.env` names the
-   worktree. This is how named issues like `SPOT-123` are associated.
-2. **The worktree name** — a basename that *is* a Kanban task id
-   (`t_[0-9a-f]+`), with or without a purpose suffix, belongs to that task
-   whether or not any metadata survives. `t_35c15c8a` infers `t_35c15c8a`;
-   `t_3626513e-revert` and `t_69b6784b-di` infer `t_3626513e` and
-   `t_69b6784b`. Deleting the artifacts of such a worktree does not make it
-   removable — the gate follows the name.
+#### 1. Local metadata
+
+`artifacts/*/run.json` or `runs/*.env` names the worktree. This is how named
+issues like `SPOT-123` are associated when their metadata still exists.
+
+#### 2. The worktree name is a Kanban task id
+
+A basename that *is* a Kanban task id (`t_[0-9a-f]+`), with or without a purpose
+suffix, belongs to that task whether or not any metadata survives. `t_35c15c8a`
+infers `t_35c15c8a`; `t_3626513e-revert` and `t_69b6784b-di` infer `t_3626513e`
+and `t_69b6784b`. Deleting the artifacts of such a worktree does not make it
+removable — the gate follows the name.
 
 Inference is anchored to the whole basename and the hex run is greedy, so
 approving one task never leaks to a similarly-named one: `t_3626513e` does not
@@ -198,15 +211,60 @@ task), and it covers `t_3626513e-revert` only because that name *is*
 `t_3626513e` plus a suffix. The inferred task is reported in the record's
 `inferred_task` field and listed under `tasks` with `source: worktree-name`.
 
-or, durably, `task_cleanup_approved` in the config file. Adding a task there is
-an explicit assertion that you looked at the board and it is completed or
-otherwise approved for cleanup. Approval never overrides anything else: an
-in-flight local run, a dirty tree, a held lock, or `protected_tasks` all still
+#### 3. The generic basename fallback
+
+`t_<hex>` is the only name shape that can be *inferred* as a Kanban id, but it
+is far from the only name in use. Agent-task issues and their worktrees are also
+called `SK-123`, `SPOT-123`, `SAL-45`, other arbitrary task keys, or nothing
+task-shaped at all (`payments-spike`, a legacy topic directory). If such a
+worktree has no `artifacts/*/run.json` or `runs/*.env` entry — deleted, never
+written, or written on another host — there is no association *and* no
+inference, and the two gates above would both miss it.
+
+So they do not miss it. When a managed worktree has **neither** an
+artifact-derived association **nor** a recognised `t_<hex>` inference, the tool
+synthesises a cleanup identity from the **exact worktree basename** and blocks
+the worktree with `worktree-cleanup-not-approved` until that name is approved:
+
+```bash
+worktree-gc collect --approve-task-cleanup SK-123 --approve --worktree <path>
+```
+
+The synthesised identity is reported in the record's `cleanup_identity` field
+and listed under `tasks` with `source: worktree-name-fallback`, so a report
+always shows what an approval would have to name.
+
+This is deliberately conservative for topic and legacy directories: the tool
+cannot tell them apart from an active task's worktree, so the operator checks
+who owns that exact directory once and approves that exact name once.
+
+Fallback approvals are matched **verbatim**, not through the slug rule that
+applies to task ids. A directory name is not a task key, and slugging would
+collapse `SK-123`, `sk_123`, and `SK--123` onto a single approval; three
+different directories must never share one. `SK-12` therefore does not cover
+`SK-123` or `SK-1234`, and `sk-123` does not cover `SK-123`. Approve the name
+exactly as the report prints it.
+
+`--approve` on its own is *only* permission to perform removals that are
+already eligible. It never supplies a missing identity: a candidate whose
+association is unknown or absent cannot become eligible from `--approve` alone.
+
+#### Recording the approval
+
+Every gate above is cleared the same way: `--approve-task-cleanup <name>` for one
+run, or, durably, `task_cleanup_approved` in the config file. Adding an entry
+there is an explicit assertion that you looked at the board — or, for the generic
+fallback, at what owns that directory — and it is completed or otherwise approved
+for cleanup. Approval never overrides anything else: an in-flight local run, a
+dirty tree, a held lock, `protected_worktrees`, or `protected_tasks` all still
 block, and listing the same task as both protected and cleanup-approved is a
 usage error rather than a silent precedence rule.
 
-Names are matched with the `agent-task` slug rule, so `SPOT-123`, `spot-123`,
-and `spot_123` are the same task.
+Task ids (gates 1 and 2) are matched with the `agent-task` slug rule, so
+`SPOT-123`, `spot-123`, and `spot_123` are the same task. Basename fallback
+identities (gate 3) are matched verbatim, as described above. One
+`task_cleanup_approved` list feeds both; an entry is used under whichever rule
+applies to the worktree it is being tested against.
 
 ## Usage
 
@@ -265,17 +323,22 @@ picture.
   "critical_percent": 90,
   "privileged_process_probe": true,
   "strict_process_scan": false,
-  "task_cleanup_approved": ["SPOT-118", "SPOT-121", "t_35c15c8a"],
+  "task_cleanup_approved": ["SPOT-118", "SPOT-121", "t_35c15c8a", "SK-123"],
   "protected_tasks": ["SPOT-123"],
   "protected_worktrees": ["AE-V2-LAUNCH-READINESS"],
-  "protected_ignored_globs": [".env", ".env.*", "*.sqlite", "*.sql", "auth.json"]
+  "protected_ignored_globs": ["*.pem"]
 }
 ```
 
+`protected_ignored_globs` here lists only the *extra* patterns: `*.pem` is added
+to the built-in protection, not substituted for it.
+
 `task_cleanup_approved` is the authoritative gate for task-associated
 worktrees, including worktrees associated only by name (`t_35c15c8a`,
-`t_35c15c8a-revert`). Each entry means *a human checked the board and this task
-is completed or approved for cleanup*. Anything not listed — active, in review,
+`t_35c15c8a-revert`) and worktrees with no association at all, which are gated
+on their exact basename (`SK-123`, `payments-spike`). Each entry means *a human
+checked the board — or checked what owns that directory — and this is completed
+or approved for cleanup*. Anything not listed — active, in review,
 blocked, or simply unknown — stays blocked. Keep the list short and prune it:
 it is a record of decisions already made, not a standing permission. A task may
 not appear in both `task_cleanup_approved` and `protected_tasks`; that is
@@ -284,6 +347,25 @@ rejected as a usage error.
 `privileged_process_probe` controls whether the read-only `sudo -n` probe of
 uninspectable pids is attempted at all. With it off (or with no passwordless
 sudo), process coverage stays incomplete and nothing is removable.
+
+### Ignored-state protection is additive
+
+`protected_ignored_globs` is not a plain default. The built-in patterns —
+`.env`, `.env.*`, `*.sqlite`, `*.sqlite3`, `*.sql`, `*.dump`, `auth.json`,
+`.envrc` — are safety invariants: git-ignored local credentials, databases, and
+dumps are not reproducible, and losing them to a GC run is not recoverable from
+the branch that survives.
+
+Configuration therefore **adds** to them and can never subtract. Both the config
+key and the repeatable `--protect-ignored-glob` flag are merged onto the
+built-in list (duplicates dropped, order preserved), so:
+
+- `"protected_ignored_globs": []` protects exactly the built-ins — it does not
+  disable them;
+- `"protected_ignored_globs": ["*.pem"]` protects the built-ins **and** `*.pem`;
+- no config value, and no flag, can make a worktree holding a `.env` or a
+  SQLite database removable. Use `protected_worktrees` if you need a different
+  kind of exception, or move the file out of the worktree.
 
 `protected_tasks` and `protected_worktrees` exist for associations the
 workstation cannot query: a tmux session someone is about to return to, a
@@ -395,22 +477,22 @@ git worktree add ~/agent-workstation/worktrees/<name> <branch>
 
 Only the reproducible parts — `vendor/`, `node_modules/`, build output — need
 rebuilding. If a worktree held something that cannot be recreated, that is a bug
-in `protected_ignored_globs`; add the pattern before running the tool again.
+in `protected_ignored_globs`; add the pattern before running the tool again. It
+is added to the built-in patterns, so doing so can only widen protection.
 
 ## Known limitations
 
-- **Name inference covers `t_<hex>` worktrees only.** A worktree named after a
-  Kanban task is gated even with no local metadata, but a worktree whose name is
-  not a recognisable task id — a named-issue tree like `SPOT-123`, a topic tree
-  like `bold-studio-theme-redesign`, a name that merely *contains* a task id
+- **Name inference still covers `t_<hex>` worktrees only, so everything else
+  costs a per-directory approval.** A worktree whose name is not a recognisable
+  task id — a named-issue tree like `SPOT-123`, a topic tree like
+  `bold-studio-theme-redesign`, a name that merely *contains* a task id
   (`marvino-demo-t_93841552`), or one spelled with another separator
-  (`t-b3824a2f-di`) — is only associated through `artifacts/*/run.json` and
-  `runs/*.env`. If that metadata is deleted, such a worktree has no association
-  left and `task-cleanup-not-approved` does not fire for it. It is still subject
-  to every other blocker (dirty, unmerged, in use, too recent, locked) and to
-  the manual, worktree-level review that `collect --approve` requires, but the
-  external-state gate cannot fire for a task it cannot see. Use
-  `protected_worktrees` for any such tree you want pinned regardless.
+  (`t-b3824a2f-di`) — cannot be resolved to a task when its
+  `artifacts/*/run.json` and `runs/*.env` metadata is gone. That is now a
+  blocker rather than a gap: the basename becomes the cleanup identity and
+  `worktree-cleanup-not-approved` fires until an operator approves that exact
+  name. The cost is real and intended — such worktrees are never removable in
+  bulk, and each one needs its own checked, exact approval.
 - **`task_cleanup_approved` is a human assertion, not a live query.** This tool
   does not talk to the board, so an entry that was true last week is still
   trusted today. Prune the list rather than letting it accumulate.

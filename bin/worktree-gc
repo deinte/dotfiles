@@ -13,7 +13,9 @@ removed. In particular:
     task-associated worktree needs its external (board) state recorded in
     task_cleanup_approved, and a worktree *named* after a Kanban task
     (t_35c15c8a, t_3626513e-revert) needs it even when that metadata is
-    missing entirely;
+    missing entirely. A worktree with neither an association nor an inferable
+    task id (SK-123, SPOT-123, a topic name) is not exempt either: its own
+    basename becomes the cleanup identity and has to be approved verbatim;
   * `collect --approve` holds the agent-task per-worktree flock - keyed on the
     same canonical worktree path bin/agent-task hashes - from before the final
     evaluation until after `git worktree remove` returns, so no agent-task run
@@ -66,7 +68,10 @@ DEFAULTS = {
     "protected_tasks": [],
     # Ignored (git-ignored) paths that still make removal unsafe. Build output
     # such as vendor/ or node_modules/ is exactly what we want to reclaim, but
-    # local credentials and databases are not reproducible.
+    # local credentials and databases are not reproducible. These are safety
+    # invariants, not defaults: configuration and --protect-ignored-glob only
+    # ever ADD to this list (see merge_globs), so no config value - including
+    # an empty one - can switch the built-in protection off.
     # Some processes cannot be inspected at all: this user's non-dumpable ones
     # (systemd --user, sshd session leaders, php-fpm workers) and every
     # foreign-uid process. For those, /proc/<pid>/{cwd,root,exe,fd} is
@@ -137,6 +142,23 @@ def task_id_from_worktree_name(name: str) -> str:
     return match.group(1).lower() if match else ""
 
 
+def merge_globs(*groups) -> list:
+    """Concatenate glob lists, keeping order and dropping duplicates.
+
+    Used to make `protected_ignored_globs` additive: the built-ins always come
+    first and configuration can only extend them. Erasing the protection for
+    `.env`, SQLite databases, or `auth.json` is not something a config file is
+    allowed to express.
+    """
+    merged = []
+    for group in groups:
+        for entry in group or []:
+            value = str(entry).strip()
+            if value and value not in merged:
+                merged.append(value)
+    return merged
+
+
 def human_bytes(count: int) -> str:
     step = float(count)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -180,7 +202,10 @@ class Config:
     critical_percent: float = DEFAULTS["critical_percent"]
     protected_worktrees: list = field(default_factory=list)
     protected_tasks: list = field(default_factory=list)
-    protected_ignored_globs: list = field(default_factory=lambda: list(DEFAULTS["protected_ignored_globs"]))
+    # Always a superset of DEFAULTS["protected_ignored_globs"]; see merge_globs.
+    protected_ignored_globs: list = field(
+        default_factory=lambda: list(DEFAULTS["protected_ignored_globs"])
+    )
     strict_process_scan: bool = bool(DEFAULTS["strict_process_scan"])
     privileged_process_probe: bool = bool(DEFAULTS["privileged_process_probe"])
     task_cleanup_approved: list = field(default_factory=list)
@@ -199,6 +224,18 @@ class Config:
     def approved_task_slugs(self) -> set:
         """Tasks a human confirmed complete on the external board."""
         return {slugify(task) for task in self.task_cleanup_approved if slugify(task)}
+
+    @property
+    def approved_cleanup_names(self) -> set:
+        """Approvals matched against a worktree basename *verbatim*.
+
+        The generic fallback identity is a directory name, not a task id, so it
+        is compared exactly rather than through `slugify`: slugging collapses
+        `SK-123`, `sk_123` and `SK--123` onto one another, and three different
+        directories must never share one approval. The operator approves the
+        exact basename they looked at.
+        """
+        return {str(entry).strip() for entry in self.task_cleanup_approved if str(entry).strip()}
 
     @property
     def protected_worktree_paths(self) -> set:
@@ -248,8 +285,10 @@ def build_config(args) -> Config:
     config.critical_percent = float(data.get("critical_percent", DEFAULTS["critical_percent"]))
     config.protected_worktrees = list(data.get("protected_worktrees", []))
     config.protected_tasks = list(data.get("protected_tasks", []))
-    config.protected_ignored_globs = list(
-        data.get("protected_ignored_globs", DEFAULTS["protected_ignored_globs"])
+    # Additive, never replacing: a configured (or empty) list extends the
+    # built-in protection for credentials and databases, it cannot remove it.
+    config.protected_ignored_globs = merge_globs(
+        DEFAULTS["protected_ignored_globs"], data.get("protected_ignored_globs", [])
     )
     config.strict_process_scan = bool(data.get("strict_process_scan", DEFAULTS["strict_process_scan"]))
     config.privileged_process_probe = bool(
@@ -265,7 +304,9 @@ def build_config(args) -> Config:
         config.critical_percent = float(args.critical_percent)
     config.protected_worktrees += list(getattr(args, "protect_worktree", None) or [])
     config.protected_tasks += list(getattr(args, "protect_task", None) or [])
-    config.protected_ignored_globs += list(getattr(args, "protect_ignored_glob", None) or [])
+    config.protected_ignored_globs = merge_globs(
+        config.protected_ignored_globs, getattr(args, "protect_ignored_glob", None)
+    )
     config.task_cleanup_approved += list(getattr(args, "approve_task_cleanup", None) or [])
     if getattr(args, "strict_process_scan", False):
         config.strict_process_scan = True
@@ -1187,6 +1228,9 @@ def evaluate_worktree(path: str, config: Config, state: HostState, self_path: st
         "age_days": None,
         "tasks": [],
         "inferred_task": "",
+        # Set only when neither an association nor a task-id inference exists
+        # and the basename itself had to stand in as the cleanup identity.
+        "cleanup_identity": "",
         "blockers": [],
         "notes": [],
         "inodes": None,
@@ -1416,6 +1460,37 @@ def evaluate_worktree(path: str, config: Config, state: HostState, self_path: st
             )
         if slugify(inferred) in config.protected_task_slugs:
             block("protected-task", inferred)
+
+    # Everything else. Only `t_<hex>` is inferable as a Kanban id, but agent
+    # tasks are just as often named `SK-123`, `SPOT-123`, `SAL-45`, an
+    # arbitrary task key, or a topic - and any of those can lose its
+    # artifacts/runs metadata, or never have had any. Those worktrees must not
+    # fall out of the external-state gate merely because nothing local names
+    # them, so the basename itself becomes the cleanup identity and has to be
+    # approved verbatim.
+    #
+    # This is deliberately conservative for topic and legacy directories: the
+    # operator checks who owns that exact directory once, approves that exact
+    # name, and nothing else is covered by it. `--approve` alone can never
+    # make a candidate with an unknown association eligible.
+    if not associations and not inferred:
+        name = record["name"]
+        if not name:
+            block("worktree-cleanup-not-approved", "no basename to attribute cleanup to")
+        else:
+            record["cleanup_identity"] = name
+            record["tasks"].append(
+                {"issue": name, "source": "worktree-name-fallback", "in_flight": False,
+                 "detail": f"no task association and no inferable task id for {name}; "
+                           "the worktree name is the cleanup identity"}
+            )
+            if name not in config.approved_cleanup_names:
+                block(
+                    "worktree-cleanup-not-approved",
+                    f"{name}: no task association and no inferable task id, so the external "
+                    f"state of this worktree is unknown; add the exact name {name!r} to "
+                    "task_cleanup_approved once you have checked what owns it",
+                )
 
     if record["name"] and slugify(record["name"]) in config.protected_task_slugs:
         block("protected-task", record["name"])
@@ -1819,7 +1894,9 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--approve-task-cleanup", action="append",
                          help="task whose EXTERNAL state you confirmed completed/cleanup-approved "
                               "(repeatable); worktrees associated with the task, or named after it "
-                              "(t_35c15c8a, t_35c15c8a-revert), are blocked without it")
+                              "(t_35c15c8a, t_35c15c8a-revert), are blocked without it. A worktree "
+                              "with neither an association nor an inferable task id is gated on its "
+                              "exact basename (SK-123, a topic name), matched verbatim")
         sub.add_argument("--strict-process-scan", action="store_true",
                          help="block every removal whenever any process needed the privileged probe")
         sub.add_argument("--no-privileged-process-probe", action="store_true",
