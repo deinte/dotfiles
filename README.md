@@ -10,7 +10,7 @@ Personal dotfiles for macOS, optimized for PHP/Laravel development with Valet.
 - **PHP/Laravel**: Valet-based workflow with PHP Monitor
 - **Node**: FNM (Fast Node Manager) instead of NVM
 - **Claude Code**: Skills, agents, and settings
-- **Linux dev workstation**: Reproducible task runner and workstation doctor (see [Linux dev-workstation docs](docs/dev-workstation.md))
+- **Linux dev workstation**: Reproducible task runner, workstation doctor, and worktree retention/inode tooling (see [Linux dev-workstation docs](docs/dev-workstation.md) and [worktree retention](docs/worktree-retention.md))
 
 ## Quick Start
 
@@ -39,7 +39,8 @@ exec zsh
 │   ├── agent-task      # Linux task lifecycle runner
 │   ├── install-linux-devstation
 │   ├── workstation-sync
-│   └── workstation-doctor
+│   ├── workstation-doctor
+│   └── worktree-gc         # worktree retention inventory + inode alerting
 ├── config/
 │   ├── Brewfile        # Homebrew packages
 │   ├── starship.toml   # Prompt configuration

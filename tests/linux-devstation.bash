@@ -10,7 +10,7 @@ snapshot() { find "$TMP" \( -type f -o -type l \) -print0 | sort -z | xargs -0 -
 mkdir -p "$TMP/ws/repos" "$TMP/ws/worktrees" "$TMP/ws/artifacts"; echo keep >"$TMP/ws/repos/keep"; echo keep >"$TMP/ws/worktrees/keep"; echo keep >"$TMP/ws/artifacts/keep"
 "$ROOT/bin/install-linux-devstation"
 for d in repos worktrees artifacts runs locks scripts; do [[ -d "$TMP/ws/$d" ]]; done
-for f in agent-task workstation-doctor; do [[ -f "$TMP/ws/scripts/$f" && -x "$TMP/ws/scripts/$f" && "$(stat -c %a "$TMP/ws/scripts/$f")" == 700 ]]; [[ -L "$HOME/.local/bin/$f" && "$(readlink "$HOME/.local/bin/$f")" == "$TMP/ws/scripts/$f" ]]; done
+for f in agent-task workstation-doctor worktree-gc; do [[ -f "$TMP/ws/scripts/$f" && -x "$TMP/ws/scripts/$f" && "$(stat -c %a "$TMP/ws/scripts/$f")" == 700 ]]; [[ -L "$HOME/.local/bin/$f" && "$(readlink "$HOME/.local/bin/$f")" == "$TMP/ws/scripts/$f" ]]; done
 [[ -L "$HOME/.local/bin/workstation-sync" && "$(readlink "$HOME/.local/bin/workstation-sync")" == "$ROOT/bin/workstation-sync" ]]
 baseline="$(snapshot)"; "$ROOT/bin/install-linux-devstation" >/dev/null; [[ "$baseline" == "$(snapshot)" ]]
 echo changed >>"$TMP/ws/scripts/agent-task"; "$ROOT/bin/install-linux-devstation" >/dev/null

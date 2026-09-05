@@ -16,6 +16,16 @@ slugify() {
 }
 
 issue_dir() { printf '%s/artifacts/%s' "$ROOT" "$1"; }
+
+# The one spelling of a worktree path that is ever hashed into a lock name.
+# A lexical variant (/./, //, ..) or a symlinked parent must not be able to
+# produce a second, non-contending lock file, so every writer - and worktree-gc
+# - keys on the git top-level, resolved to its real path.
+canonical_worktree() {
+    local top
+    top="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || return 1
+    realpath -- "$top" 2>/dev/null || printf '%s' "$top"
+}
 state_file() { printf '%s/%s.env' "$RUNS_DIR" "$(slugify "$1")"; }
 
 usage() {
@@ -144,7 +154,7 @@ attach() {
     validate_common "$mode" "$max_hours"
     [[ -d "$worktree" ]] || die "Worktree path does not exist: $worktree"
     local git_root
-    git_root="$(git -C "$worktree" rev-parse --show-toplevel 2>/dev/null)" || die "Not a git worktree: $worktree"
+    git_root="$(canonical_worktree "$worktree")" || die "Not a git worktree: $worktree"
     worktree="$git_root"
     local branch
     branch="$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null)" || die 'Worktree HEAD is detached'
@@ -286,6 +296,10 @@ start_run() {
     [[ -f "$artifacts/run.json" ]] || die "No prepared task metadata at $artifacts/run.json"
     worktree="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["worktree"])' "$artifacts/run.json")"
     [[ -e "$worktree/.git" ]] || die 'Worktree missing'
+    # run.json is data on disk: it can hold a lexical spelling that hashes to a
+    # different lock than the one worktree-gc takes. Canonicalise before the
+    # key, the state file, and the exported WORKTREE.
+    worktree="$(canonical_worktree "$worktree")" || die "Not a git worktree: $worktree"
     [[ "$allow_dirty" == true || -z "$(git -C "$worktree" status --porcelain)" ]] || die 'Worktree is dirty; use --allow-dirty only for deliberate recovery'
     unit="agent-task-$(slugify "$issue")"
     [[ "$(systemctl --user is-active "$unit.service" 2>/dev/null || true)" != active ]] || die 'Run already active'

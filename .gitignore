@@ -26,3 +26,7 @@ config/claude/plugins/marketplaces/
 
 # Local overrides (not committed)
 home/.zshrc.local
+
+# Python bytecode from local test runs
+__pycache__/
+*.pyc

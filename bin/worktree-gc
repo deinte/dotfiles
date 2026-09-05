@@ -1,0 +1,1947 @@
+#!/usr/bin/env python3
+"""Conservative retention/GC inventory for agent-workstation git worktrees.
+
+Default behaviour is a read-only, dry-run inventory. Nothing is ever deleted
+unless `collect --approve` is passed explicitly. Every safety predicate fails
+closed: when a fact cannot be established the worktree is blocked, never
+removed. In particular:
+
+  * a process whose /proc references cannot be read leaves coverage incomplete,
+    which blocks every removal until a read-only privileged probe proves what it
+    actually holds;
+  * local agent-task metadata never authorises removal on its own - a
+    task-associated worktree needs its external (board) state recorded in
+    task_cleanup_approved, and a worktree *named* after a Kanban task
+    (t_35c15c8a, t_3626513e-revert) needs it even when that metadata is
+    missing entirely. A worktree with neither an association nor an inferable
+    task id (SK-123, SPOT-123, a topic name) is not exempt either: its own
+    basename becomes the cleanup identity and has to be approved verbatim;
+  * `collect --approve` holds the agent-task per-worktree flock - keyed on the
+    same canonical worktree path bin/agent-task hashes - from before the final
+    evaluation until after `git worktree remove` returns, so no agent-task run
+    can start in the check-to-delete window. That final evaluation re-fetches
+    origin and re-proves reachability rather than trusting the plan's.
+
+Commands
+  inventory     read-only eligibility/blocker report with estimated reclaim
+  collect       plan removals; deletes only with --approve
+  inode-check   filesystem inode/space alert suitable for monitoring
+
+See docs/worktree-retention.md for the approval gate and rollout policy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from fnmatch import fnmatch
+from pathlib import Path
+
+# inventory/collect exit codes
+EXIT_OK = 0
+EXIT_FAILURE = 1
+EXIT_USAGE = 2
+
+# inode-check exit codes (Nagios-style, for monitoring)
+CHECK_OK = 0
+CHECK_WARN = 1
+CHECK_CRITICAL = 2
+CHECK_UNKNOWN = 3
+
+TERMINAL_RUN_STATES = {"COMPLETED", "FAILED", "TIMED_OUT", "STOPPED"}
+
+DEFAULTS = {
+    "min_age_days": 14.0,
+    "warn_percent": 80.0,
+    "critical_percent": 90.0,
+    "protected_worktrees": [],
+    "protected_tasks": [],
+    # Ignored (git-ignored) paths that still make removal unsafe. Build output
+    # such as vendor/ or node_modules/ is exactly what we want to reclaim, but
+    # local credentials and databases are not reproducible. These are safety
+    # invariants, not defaults: configuration and --protect-ignored-glob only
+    # ever ADD to this list (see merge_globs), so no config value - including
+    # an empty one - can switch the built-in protection off.
+    # Some processes cannot be inspected at all: this user's non-dumpable ones
+    # (systemd --user, sshd session leaders, php-fpm workers) and every
+    # foreign-uid process. For those, /proc/<pid>/{cwd,root,exe,fd} is
+    # unreadable, so "nothing is using this worktree" is unproven. A read-only
+    # privileged probe (sudo -n, never interactive) is attempted to close that
+    # gap; anything it cannot cover blocks removal.
+    "privileged_process_probe": True,
+    # Paranoid: block even when the probe proved absence, as long as any
+    # process needed one.
+    "strict_process_scan": False,
+    # Task identifiers whose EXTERNAL (Kanban/board) state a human has checked
+    # and confirmed completed / approved for cleanup. Local agent-task run
+    # metadata is not authoritative; an associated worktree stays blocked until
+    # its task appears here.
+    "task_cleanup_approved": [],
+    "protected_ignored_globs": [
+        ".env",
+        ".env.*",
+        "*.sqlite",
+        "*.sqlite3",
+        "*.sql",
+        "*.dump",
+        "auth.json",
+        ".envrc",
+    ],
+}
+
+GIT_TIMEOUT = 120
+
+
+def now() -> float:
+    return time.time()
+
+
+def die(message: str) -> None:
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(EXIT_USAGE)
+
+
+def slugify(value: str) -> str:
+    """Match the `slugify` in bin/agent-task so task associations line up."""
+    lowered = value.lower()
+    squeezed = re.sub(r"[^a-z0-9]+", "-", lowered)
+    return squeezed.strip("-")[:48]
+
+
+# A worktree named after a Kanban task, optionally with a purpose suffix:
+# `t_3626513e`, `t_3626513e-revert`. The whole basename must match and the hex
+# run is greedy, so `t_3626513eab` infers itself rather than `t_3626513e`, and
+# neither `t_3626513` nor `t_3626513e` can stand in for the other.
+TASK_WORKTREE_NAME_RE = re.compile(r"^(t_[0-9a-f]+)(?:[-_].*)?$", re.IGNORECASE)
+
+
+def task_id_from_worktree_name(name: str) -> str:
+    """Infer the Kanban task a worktree belongs to from its basename alone.
+
+    Local `artifacts/*/run.json` and `runs/*.env` metadata can be deleted or
+    never written, so it cannot be the only thing that ties a worktree to a
+    task. A basename that *is* a task id ties it regardless.
+
+    Returns "" when the name is not a recognisable task id. Recognition is
+    deliberately anchored and exact: `t_<hex>`, optionally followed by a `-` or
+    `_` suffix. A name that merely contains a task id (`marvino-demo-t_93841552`)
+    or spells it with another separator (`t-b3824a2f-di`) is NOT recognised and
+    stays on the manual worktree-level review path.
+    """
+    match = TASK_WORKTREE_NAME_RE.match(str(name).strip().rstrip("/"))
+    return match.group(1).lower() if match else ""
+
+
+def merge_globs(*groups) -> list:
+    """Concatenate glob lists, keeping order and dropping duplicates.
+
+    Used to make `protected_ignored_globs` additive: the built-ins always come
+    first and configuration can only extend them. Erasing the protection for
+    `.env`, SQLite databases, or `auth.json` is not something a config file is
+    allowed to express.
+    """
+    merged = []
+    for group in groups:
+        for entry in group or []:
+            value = str(entry).strip()
+            if value and value not in merged:
+                merged.append(value)
+    return merged
+
+
+def human_bytes(count: int) -> str:
+    step = float(count)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if step < 1024 or unit == "TiB":
+            return f"{step:.1f}{unit}" if unit != "B" else f"{int(step)}B"
+        step /= 1024
+    return f"{step:.1f}TiB"
+
+
+def signed_bytes(count: int) -> str:
+    """human_bytes that keeps the sign, so negative deltas stay visible."""
+    return f"-{human_bytes(-count)}" if count < 0 else human_bytes(count)
+
+
+def run_command(args, timeout=GIT_TIMEOUT, cwd=None):
+    """Run a command, never raising. Returns (ok, stdout, stderr)."""
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, "", str(exc)
+    return proc.returncode == 0, proc.stdout, proc.stderr
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Config:
+    root: Path
+    min_age_days: float = DEFAULTS["min_age_days"]
+    warn_percent: float = DEFAULTS["warn_percent"]
+    critical_percent: float = DEFAULTS["critical_percent"]
+    protected_worktrees: list = field(default_factory=list)
+    protected_tasks: list = field(default_factory=list)
+    # Always a superset of DEFAULTS["protected_ignored_globs"]; see merge_globs.
+    protected_ignored_globs: list = field(
+        default_factory=lambda: list(DEFAULTS["protected_ignored_globs"])
+    )
+    strict_process_scan: bool = bool(DEFAULTS["strict_process_scan"])
+    privileged_process_probe: bool = bool(DEFAULTS["privileged_process_probe"])
+    task_cleanup_approved: list = field(default_factory=list)
+    config_path: str = ""
+    config_errors: list = field(default_factory=list)
+
+    @property
+    def worktrees_dir(self) -> Path:
+        return self.root / "worktrees"
+
+    @property
+    def protected_task_slugs(self) -> set:
+        return {slugify(task) for task in self.protected_tasks if slugify(task)}
+
+    @property
+    def approved_task_slugs(self) -> set:
+        """Tasks a human confirmed complete on the external board."""
+        return {slugify(task) for task in self.task_cleanup_approved if slugify(task)}
+
+    @property
+    def approved_cleanup_names(self) -> set:
+        """Approvals matched against a worktree basename *verbatim*.
+
+        The generic fallback identity is a directory name, not a task id, so it
+        is compared exactly rather than through `slugify`: slugging collapses
+        `SK-123`, `sk_123` and `SK--123` onto one another, and three different
+        directories must never share one approval. The operator approves the
+        exact basename they looked at.
+        """
+        return {str(entry).strip() for entry in self.task_cleanup_approved if str(entry).strip()}
+
+    @property
+    def protected_worktree_paths(self) -> set:
+        resolved = set()
+        for entry in self.protected_worktrees:
+            path = Path(os.path.expanduser(str(entry)))
+            if not path.is_absolute():
+                path = self.worktrees_dir / path
+            resolved.add(str(path))
+            try:
+                resolved.add(str(path.resolve()))
+            except OSError:
+                pass
+        return resolved
+
+
+def load_config(root: Path, config_path: str | None) -> tuple[dict, str, list]:
+    """Read the optional JSON config. Unreadable config is an error, not a default."""
+    if config_path:
+        path = Path(os.path.expanduser(config_path))
+        required = True
+    else:
+        path = root / "config" / "worktree-gc.json"
+        required = False
+    if not path.exists():
+        if required:
+            die(f"config file not found: {path}")
+        return {}, "", []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        die(f"config file is unreadable: {path}: {exc}")
+    if not isinstance(data, dict):
+        die(f"config file must contain a JSON object: {path}")
+    errors = [key for key in data if key not in DEFAULTS]
+    return data, str(path), errors
+
+
+def build_config(args) -> Config:
+    root = Path(os.path.expanduser(args.root)).absolute()
+    data, config_path, unknown = load_config(root, getattr(args, "config", None))
+    config = Config(root=root, config_path=config_path)
+    config.config_errors = [f"unknown config key: {key}" for key in unknown]
+
+    config.min_age_days = float(data.get("min_age_days", DEFAULTS["min_age_days"]))
+    config.warn_percent = float(data.get("warn_percent", DEFAULTS["warn_percent"]))
+    config.critical_percent = float(data.get("critical_percent", DEFAULTS["critical_percent"]))
+    config.protected_worktrees = list(data.get("protected_worktrees", []))
+    config.protected_tasks = list(data.get("protected_tasks", []))
+    # Additive, never replacing: a configured (or empty) list extends the
+    # built-in protection for credentials and databases, it cannot remove it.
+    config.protected_ignored_globs = merge_globs(
+        DEFAULTS["protected_ignored_globs"], data.get("protected_ignored_globs", [])
+    )
+    config.strict_process_scan = bool(data.get("strict_process_scan", DEFAULTS["strict_process_scan"]))
+    config.privileged_process_probe = bool(
+        data.get("privileged_process_probe", DEFAULTS["privileged_process_probe"])
+    )
+    config.task_cleanup_approved = list(data.get("task_cleanup_approved", []))
+
+    if getattr(args, "min_age_days", None) is not None:
+        config.min_age_days = float(args.min_age_days)
+    if getattr(args, "warn_percent", None) is not None:
+        config.warn_percent = float(args.warn_percent)
+    if getattr(args, "critical_percent", None) is not None:
+        config.critical_percent = float(args.critical_percent)
+    config.protected_worktrees += list(getattr(args, "protect_worktree", None) or [])
+    config.protected_tasks += list(getattr(args, "protect_task", None) or [])
+    config.protected_ignored_globs = merge_globs(
+        config.protected_ignored_globs, getattr(args, "protect_ignored_glob", None)
+    )
+    config.task_cleanup_approved += list(getattr(args, "approve_task_cleanup", None) or [])
+    if getattr(args, "strict_process_scan", False):
+        config.strict_process_scan = True
+    if getattr(args, "no_privileged_process_probe", False):
+        config.privileged_process_probe = False
+
+    if config.min_age_days < 0:
+        die("--min-age-days must not be negative")
+    conflicting = sorted(config.approved_task_slugs & config.protected_task_slugs)
+    if conflicting:
+        die(f"task(s) both protected and cleanup-approved: {', '.join(conflicting)}")
+    return config
+
+
+# --------------------------------------------------------------------------
+# host state collection
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ProcessScan:
+    holders: dict = field(default_factory=dict)  # pid -> list of (kind, path, writable)
+    restricted: dict = field(default_factory=dict)  # own pid -> cmdline (links unreadable)
+    unreadable_foreign_pids: list = field(default_factory=list)
+    # pid -> why its filesystem references could not be established. While this
+    # is non-empty, "no process references this worktree" is unproven and every
+    # removal is blocked.
+    uncovered_pids: dict = field(default_factory=dict)
+    probe: str = ""  # what the privileged coverage probe did, for the report
+    error: str = ""
+
+    @property
+    def coverage_complete(self) -> bool:
+        return not self.uncovered_pids
+
+
+def _read_link(path: str) -> tuple:
+    """Read one /proc symlink. Returns (target, failure).
+
+    ENOENT is a *disappearance*, not a failure: the process exited, the fd was
+    closed between the listing and the readlink, or the reference genuinely does
+    not exist (a kernel thread has no `exe`). A reference that is gone cannot be
+    holding a worktree open, so nothing is left unproven and the pid stays
+    covered - turning that ordinary race into a permanent blocker would be
+    wrong.
+
+    Every other error - EACCES/EPERM for a non-dumpable or foreign process,
+    EINVAL, anything else - IS a failure to inspect. `failure` is then a
+    non-empty reason and the caller must leave the pid uncovered.
+    """
+    try:
+        return os.readlink(path), ""
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return None, ""
+        return None, f"{path}: {exc}"
+    except ValueError as exc:  # e.g. an embedded NUL in the path
+        return None, f"{path}: {exc}"
+
+
+def _read_cmdline(pid_dir: str) -> str:
+    try:
+        with open(os.path.join(pid_dir, "cmdline"), "rb") as handle:
+            return handle.read().decode("utf-8", "replace").replace("\0", " ").strip()
+    except OSError:
+        return ""
+
+
+def _fd_is_writable(pid_dir: str, fd: str) -> bool:
+    try:
+        with open(os.path.join(pid_dir, "fdinfo", fd)) as handle:
+            for line in handle:
+                if line.startswith("flags:"):
+                    flags = int(line.split()[1], 8)
+                    return bool(flags & (os.O_WRONLY | os.O_RDWR))
+    except (OSError, ValueError, IndexError):
+        # Unknown access mode: assume writable, which only ever blocks removal.
+        return True
+    return False
+
+
+def scan_processes(proc_root: str = "/proc") -> ProcessScan:
+    """Record every process reference into the filesystem.
+
+    Any process whose /proc links cannot be read - this user's non-dumpable
+    ones and every foreign-uid one alike - is recorded in `uncovered_pids`.
+    Uncovered pids are a fail-closed condition: absence of a cwd or open writer
+    inside a candidate is unproven while any of them remain, so removal is
+    blocked. `resolve_process_coverage` is the only way to clear them, and it
+    does so only by actually reading their references.
+    """
+    scan = ProcessScan()
+    try:
+        entries = os.listdir(proc_root)
+    except OSError as exc:
+        scan.error = f"cannot read {proc_root}: {exc}"
+        return scan
+    try:
+        own_uid = os.getuid()
+    except AttributeError:  # pragma: no cover - non-POSIX
+        own_uid = -1
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid_dir = os.path.join(proc_root, entry)
+        # Every reason this pid could not be fully inspected. Partial reads
+        # count: one unresolvable fd is enough to leave it uncovered, because
+        # that fd could point inside a candidate worktree.
+        failures = []
+        try:
+            pid_uid = os.stat(pid_dir).st_uid
+        except FileNotFoundError:
+            continue  # process exited between listdir and stat
+        except OSError as exc:
+            pid_uid = -2  # unknown owner; classified as foreign below
+            failures.append(f"{pid_dir}: {exc}")
+        references = []
+        for kind in ("cwd", "root", "exe"):
+            target, failure = _read_link(os.path.join(pid_dir, kind))
+            if failure:
+                failures.append(failure)
+                continue
+            if target is None:
+                continue  # gone: an exited process, or a thread with no exe
+            references.append((kind, target, False))
+        fd_dir = os.path.join(pid_dir, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except FileNotFoundError:
+            fds = []  # the process exited; it holds nothing open any more
+        except OSError as exc:
+            fds = []
+            failures.append(f"{fd_dir}: {exc}")
+        for fd in fds:
+            target, failure = _read_link(os.path.join(fd_dir, fd))
+            if failure:
+                failures.append(failure)
+                continue
+            if target is None or not target.startswith("/"):
+                continue
+            references.append((f"fd{fd}", target, _fd_is_writable(pid_dir, fd)))
+        if failures:
+            detail = failures[0]
+            if pid_uid == own_uid:
+                cmdline = _read_cmdline(pid_dir)
+                scan.restricted[entry] = cmdline
+                scan.uncovered_pids[entry] = (
+                    f"own pid, /proc reference uninspectable ({detail}); argv: {cmdline[:60]}"
+                )
+            else:
+                scan.unreadable_foreign_pids.append(entry)
+                scan.uncovered_pids[entry] = (
+                    f"foreign-uid pid, /proc reference uninspectable ({detail})"
+                )
+        if references:
+            scan.holders[entry] = references
+    return scan
+
+
+# A read-only inspector for pids this process cannot read itself. argv[1] is the
+# proc root (always "/proc" in production; a fixture root in the tests) and the
+# rest are pids. It only ever calls readlink/listdir/read-mode open under that
+# root and prints what it found; it never writes, signals, or otherwise touches
+# anything.
+#
+# Its per-pid status distinguishes the same two cases the unprivileged scan
+# does: a reference that is *gone* (ENOENT - the process exited, the fd was
+# closed under us, a kernel thread has no exe) leaves the pid `ok`, while any
+# other failure on a required cwd/root/exe/fd reference makes it `unreadable`
+# so the caller keeps that pid uncovered.
+PRIVILEGED_PROBE_SOURCE = r"""
+import errno, os, sys
+
+def vanished(exc):
+    return getattr(exc, "errno", None) == errno.ENOENT
+
+root = sys.argv[1]
+for pid in sys.argv[2:]:
+    base = root + "/" + pid
+    if not os.path.isdir(base):
+        print("PID\t%s\tgone" % pid)
+        continue
+    status = "ok"
+    for kind in ("cwd", "root", "exe"):
+        try:
+            target = os.readlink(base + "/" + kind)
+        except OSError as exc:
+            if not vanished(exc):
+                status = "unreadable"
+            continue
+        print("REF\t%s\t%s\t0\t%s" % (pid, kind, target))
+    try:
+        fds = os.listdir(base + "/fd")
+    except OSError as exc:
+        fds = []
+        if not vanished(exc):
+            status = "unreadable"
+    for fd in fds:
+        try:
+            target = os.readlink(base + "/fd/" + fd)
+        except OSError as exc:
+            if not vanished(exc):
+                status = "unreadable"
+            continue
+        if not target.startswith("/"):
+            continue
+        writable = "1"
+        try:
+            with open(base + "/fdinfo/" + fd) as handle:
+                for line in handle:
+                    if line.startswith("flags:"):
+                        flags = int(line.split()[1], 8)
+                        writable = "1" if flags & (os.O_WRONLY | os.O_RDWR) else "0"
+        except (OSError, ValueError, IndexError):
+            writable = "1"
+        print("REF\t%s\tfd%s\t%s\t%s" % (pid, fd, writable, target))
+    print("PID\t%s\t%s" % (pid, status))
+print("PROBE-OK")
+"""
+
+PROBE_SENTINEL = "PROBE-OK"
+PROBE_PROC_ROOT = "/proc"
+
+
+def default_privileged_probe(pids) -> list:
+    """Non-interactive (`sudo -n`) read-only probe. Never prompts for a password."""
+    return ["sudo", "-n", "--", sys.executable, "-c", PRIVILEGED_PROBE_SOURCE,
+            PROBE_PROC_ROOT, *pids]
+
+
+def resolve_process_coverage(scan: ProcessScan, enabled: bool = True, probe=None) -> ProcessScan:
+    """Try to prove what the uncovered pids reference; leave them uncovered if not.
+
+    A pid is only cleared when the probe reported a definite result for it
+    (`ok`, with its references merged in, or `gone`). Partial or unauthenticated
+    probe output clears nothing: the sentinel must be present and every line
+    must parse, or the whole run is discarded, and a pid the probe listed
+    references for but never gave a final status to stays uncovered.
+    """
+    if scan.error or not scan.uncovered_pids:
+        scan.probe = "not needed"
+        return scan
+    if not enabled:
+        scan.probe = f"disabled; {len(scan.uncovered_pids)} pid(s) uninspectable"
+        return scan
+
+    pids = sorted(scan.uncovered_pids, key=int)
+    ok, out, err = run_command((probe or default_privileged_probe)(pids), timeout=120)
+    if not ok or PROBE_SENTINEL not in out.splitlines():
+        detail = (err or "").strip().splitlines()
+        scan.probe = "privileged probe unavailable: " + (detail[-1] if detail else "no usable output")
+        return scan
+
+    references: dict = {}
+    statuses: dict = {}
+    # Strict parsing: a line we do not understand means the output is not the
+    # probe's, or is mangled (a path containing a newline would do it), so the
+    # whole run is discarded rather than half-believed.
+    for line in out.splitlines():
+        if line == PROBE_SENTINEL:
+            continue
+        parts = line.split("\t", 4)  # maxsplit keeps tabs inside a path intact
+        if parts[0] == "REF" and len(parts) == 5 and parts[3] in {"0", "1"}:
+            references.setdefault(parts[1], []).append((parts[2], parts[4], parts[3] == "1"))
+        elif parts[0] == "PID" and len(parts) == 3:
+            statuses[parts[1]] = parts[2]
+        else:
+            scan.probe = f"privileged probe output not understood ({line[:60]!r}); nothing cleared"
+            return scan
+
+    cleared = 0
+    for pid in pids:
+        if statuses.get(pid) not in {"ok", "gone"}:
+            continue
+        found = references.get(pid, [])
+        if found:
+            scan.holders.setdefault(pid, []).extend(found)
+        # Authoritative references replace the argv guess for this pid.
+        scan.restricted.pop(pid, None)
+        scan.uncovered_pids.pop(pid, None)
+        cleared += 1
+    scan.probe = (
+        f"privileged probe covered {cleared}/{len(pids)} pid(s); "
+        f"{len(scan.uncovered_pids)} still uninspectable"
+    )
+    return scan
+
+
+def path_contains(parent: str, child: str) -> bool:
+    """True when child is parent itself or lives beneath it (textual, no I/O)."""
+    parent = parent.rstrip("/")
+    if not parent:
+        return False
+    return child == parent or child.startswith(parent + "/")
+
+
+def processes_using(scan: ProcessScan, paths) -> list:
+    hits = []
+    for pid, references in sorted(scan.holders.items(), key=lambda item: int(item[0])):
+        for kind, target, writable in references:
+            if any(path_contains(path, target) for path in paths):
+                if kind.startswith("fd") and not writable:
+                    hits.append(f"pid {pid} {kind} (read-only) -> {target}")
+                else:
+                    hits.append(f"pid {pid} {kind} -> {target}")
+                break
+    return hits
+
+
+def restricted_processes_naming(scan: ProcessScan, paths) -> list:
+    """Non-dumpable own processes are matched on argv, the only readable signal."""
+    hits = []
+    for pid, cmdline in sorted(scan.restricted.items(), key=lambda item: int(item[0])):
+        if any(path and path in cmdline for path in paths):
+            hits.append(f"pid {pid} argv -> {cmdline[:80]}")
+    return hits
+
+
+@dataclass
+class ListenerScan:
+    pids: set = field(default_factory=set)
+    details: dict = field(default_factory=dict)  # pid -> description
+    error: str = ""
+
+
+SS_PID_RE = re.compile(r'\(\("(?P<name>[^"]*)",pid=(?P<pid>\d+),fd=(?P<fd>\d+)\)')
+
+
+def scan_listeners(command=None) -> ListenerScan:
+    """Map listening TCP/UDP sockets to the PIDs that own them."""
+    scan = ListenerScan()
+    args = command or ["ss", "-lntupH"]
+    ok, out, err = run_command(args, timeout=30)
+    if not ok:
+        scan.error = (err or "ss failed").strip().splitlines()[0] if (err or "").strip() else "ss failed"
+        return scan
+    for line in out.splitlines():
+        for match in SS_PID_RE.finditer(line):
+            pid = match.group("pid")
+            scan.pids.add(pid)
+            scan.details.setdefault(pid, f"{match.group('name')} listening: {' '.join(line.split()[:5])}")
+    return scan
+
+
+@dataclass
+class UnitScan:
+    units: list = field(default_factory=list)  # dicts with id/state/paths/source
+    active_ids: set = field(default_factory=set)
+    error: str = ""
+
+
+def _systemctl_show(unit_ids):
+    properties = [
+        "--property=Id",
+        "--property=WorkingDirectory",
+        "--property=ExecStart",
+        "--property=ExecStartPre",
+        "--property=Environment",
+        "--property=ActiveState",
+        "--property=FragmentPath",
+    ]
+    ok, out, err = run_command(["systemctl", "--user", "show", *properties, *unit_ids], timeout=60)
+    return ok, out, err
+
+
+def scan_units(config_dir: Path | None = None, list_command=None, show=None) -> UnitScan:
+    """Collect user units that reference a filesystem path.
+
+    Both loaded units (transient previews, agent-task runs) and on-disk unit
+    files are inspected: a stopped preview unit still owns its worktree.
+    """
+    scan = UnitScan()
+    show = show or _systemctl_show
+    ok, out, err = run_command(
+        list_command or ["systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", "--type=service"],
+        timeout=60,
+    )
+    if not ok:
+        scan.error = (err or "systemctl failed").strip().splitlines()[0] if (err or "").strip() else "systemctl failed"
+        return scan
+    unit_ids = []
+    for line in out.splitlines():
+        parts = line.split()
+        if parts and parts[0].endswith(".service"):
+            unit_ids.append(parts[0])
+    if unit_ids:
+        ok, shown, err = show(unit_ids)
+        if not ok:
+            scan.error = (err or "systemctl show failed").strip().splitlines()[0] or "systemctl show failed"
+            return scan
+        block = {}
+        for line in shown.splitlines():
+            if not line.strip():
+                if block:
+                    scan.units.append(_unit_record(block))
+                block = {}
+                continue
+            key, _, value = line.partition("=")
+            block[key] = value
+        if block:
+            scan.units.append(_unit_record(block))
+    for unit in scan.units:
+        if unit["active_state"] in {"active", "activating", "reloading", "deactivating"}:
+            scan.active_ids.add(unit["id"])
+
+    config_dir = config_dir or Path(
+        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    ) / "systemd" / "user"
+    try:
+        unit_files = sorted(config_dir.glob("*.service"))
+    except OSError:
+        unit_files = []
+    known = {unit["id"] for unit in scan.units}
+    for unit_file in unit_files:
+        try:
+            text = unit_file.read_text(errors="replace")
+        except OSError:
+            continue
+        if unit_file.name in known:
+            for unit in scan.units:
+                if unit["id"] == unit_file.name:
+                    unit["text"] += "\n" + text
+            continue
+        scan.units.append(
+            {
+                "id": unit_file.name,
+                "active_state": "unloaded",
+                "text": text,
+                "source": str(unit_file),
+            }
+        )
+    return scan
+
+
+def _unit_record(block: dict) -> dict:
+    text = "\n".join(
+        f"{key}={block.get(key, '')}"
+        for key in ("WorkingDirectory", "ExecStart", "ExecStartPre", "Environment", "FragmentPath")
+    )
+    return {
+        "id": block.get("Id", ""),
+        "active_state": block.get("ActiveState", ""),
+        "text": text,
+        "source": block.get("FragmentPath", "") or "transient",
+    }
+
+
+def units_referencing(scan: UnitScan, paths) -> list:
+    hits = []
+    for unit in scan.units:
+        for path in paths:
+            if path and path in unit["text"]:
+                hits.append(f"{unit['id']} ({unit['active_state']})")
+                break
+    return sorted(set(hits))
+
+
+@dataclass
+class TaskAssociation:
+    issue: str
+    source: str
+    in_flight: bool
+    detail: str
+
+
+def read_task_associations(root: Path) -> tuple[dict, list]:
+    """Map worktree path -> [TaskAssociation] from artifacts/*/run.json and runs/*.env."""
+    associations: dict = {}
+    problems: list = []
+
+    def add(path_value: str, association: TaskAssociation):
+        if not path_value:
+            return
+        keys = {path_value.rstrip("/")}
+        try:
+            keys.add(str(Path(path_value).resolve()))
+        except OSError:
+            pass
+        for key in keys:
+            associations.setdefault(key, []).append(association)
+
+    artifacts = root / "artifacts"
+    for run_json in sorted(artifacts.glob("*/run.json")):
+        try:
+            data = json.loads(run_json.read_text())
+        except (OSError, ValueError) as exc:
+            problems.append(f"unreadable {run_json}: {exc}")
+            continue
+        issue = str(data.get("issue", run_json.parent.name))
+        worktree = str(data.get("worktree", ""))
+        in_flight, detail = task_is_in_flight(run_json.parent)
+        add(worktree, TaskAssociation(issue, str(run_json), in_flight, detail))
+
+    runs = root / "runs"
+    for state_file in sorted(runs.glob("*.env")):
+        worktree = ""
+        issue = state_file.stem
+        try:
+            for line in state_file.read_text().splitlines():
+                key, _, value = line.partition("=")
+                if key in {"WORKTREE", "ISSUE"}:
+                    try:
+                        parsed = shlex.split(value)
+                    except ValueError:
+                        parsed = [value]
+                    if parsed and key == "WORKTREE":
+                        worktree = parsed[0]
+                    elif parsed:
+                        issue = parsed[0]
+        except OSError as exc:
+            problems.append(f"unreadable {state_file}: {exc}")
+            continue
+        in_flight, detail = task_is_in_flight(root / "artifacts" / issue)
+        add(worktree, TaskAssociation(issue, str(state_file), in_flight, detail))
+    return associations, problems
+
+
+def task_is_in_flight(artifacts_dir: Path) -> tuple[bool, str]:
+    """A task is in flight unless its newest run reached a terminal state."""
+    runs_dir = artifacts_dir / "runs"
+    try:
+        run_dirs = sorted((entry for entry in runs_dir.iterdir() if entry.is_dir()), key=lambda p: p.name)
+    except OSError:
+        return False, "no run directories"
+    if not run_dirs:
+        return False, "no run directories"
+    latest = run_dirs[-1]
+    result = latest / "result.json"
+    if not result.exists():
+        return True, f"{latest.name} has no result.json"
+    try:
+        state = json.loads(result.read_text()).get("state", "")
+    except (OSError, ValueError) as exc:
+        return True, f"{latest.name} result.json unreadable: {exc}"
+    if state not in TERMINAL_RUN_STATES:
+        return True, f"{latest.name} state={state or 'unknown'}"
+    return False, f"{latest.name} state={state}"
+
+
+def canonical_worktree_path(path: str) -> str:
+    """The one spelling bin/agent-task hashes: the git top-level, fully resolved.
+
+    `agent-task attach` and `agent-task start` both canonicalise to
+    `git rev-parse --show-toplevel` and then to the real path before hashing, so
+    this is the lock identity both sides must agree on. Parity is explicit here
+    rather than inherited from whatever prepare/attach happened to store.
+
+    Falls back to the resolved input when git cannot answer (the path is gone,
+    or is not a worktree) - the fallback only ever picks a different file name,
+    never skips locking.
+    """
+    ok, out, _ = git(["-C", path, "rev-parse", "--show-toplevel"])
+    candidate = out.strip() if ok and out.strip() else path
+    try:
+        return str(Path(candidate).resolve())
+    except OSError:
+        return str(Path(candidate).absolute())
+
+
+def lock_files_for(root: Path, worktree_path: str) -> list:
+    """Every lock file agent-task could pick for this worktree.
+
+    The canonical path (git top-level, resolved) is what current `agent-task`
+    hashes. The path as spelled and its plain absolute form are kept as well:
+    a run started by an older agent-task, or one already holding a legacy lock
+    taken before canonicalisation, must still be seen. Probing the extra names
+    is conservative - it can only add contention, never miss it.
+    """
+    candidates = {worktree_path, str(Path(worktree_path).absolute()),
+                  canonical_worktree_path(worktree_path)}
+    try:
+        candidates.add(str(Path(worktree_path).resolve()))
+    except OSError:
+        pass
+    digests = {hashlib.sha256(candidate.encode()).hexdigest() for candidate in candidates}
+    return sorted(root / "locks" / f"{digest}.lock" for digest in digests)
+
+
+def lock_is_held(root: Path, worktree_path: str, owned=()) -> tuple[bool, str]:
+    """Probe the agent-task per-worktree flock without disturbing a live holder.
+
+    `owned` lists lock files this process already holds (see WorktreeLockGuard).
+    flock conflicts between distinct open file descriptions even inside one
+    process, so without this our own guard would read as a foreign writer.
+    """
+    owned = {str(path) for path in owned}
+    for lock_file in lock_files_for(root, worktree_path):
+        if str(lock_file) in owned:
+            continue
+        if not lock_file.exists():
+            continue
+        try:
+            handle = open(lock_file, "a")
+        except OSError as exc:
+            return True, f"lock file unreadable: {exc}"
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            return True, f"held: {lock_file.name}"
+        finally:
+            handle.close()
+    return False, ""
+
+
+class WorktreeLockGuard:
+    """Hold the agent-task per-worktree flock across evaluation AND removal.
+
+    This closes the time-of-check/time-of-use window: without it an agent-task
+    run could start between the final re-evaluation and `git worktree remove`.
+    The lock files live in <root>/locks, outside the worktree, so holding them
+    never interferes with the removal itself.
+    """
+
+    def __init__(self, root: Path, worktree_path: str):
+        self.root = root
+        self.worktree_path = worktree_path
+        self.paths = lock_files_for(root, worktree_path)
+        self._handles: list = []
+
+    @property
+    def lock_files(self) -> set:
+        """Lock files currently held, as strings, for lock_is_held(owned=...)."""
+        return {str(path) for path, _ in self._handles}
+
+    @property
+    def held(self) -> bool:
+        return len(self._handles) == len(self.paths) and bool(self._handles)
+
+    def acquire(self) -> tuple[bool, str]:
+        try:
+            (self.root / "locks").mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return False, f"cannot create locks directory: {exc}"
+        for path in self.paths:
+            try:
+                # Same open mode as bin/agent-task: create if absent, never truncate.
+                handle = open(path, "a")
+            except OSError as exc:
+                self.release()
+                return False, f"cannot open {path.name}: {exc}"
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                handle.close()
+                self.release()
+                return False, f"{path.name} is held by another writer: {exc}"
+            self._handles.append((path, handle))
+        return True, ""
+
+    def release(self) -> None:
+        while self._handles:
+            _, handle = self._handles.pop()
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            handle.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.release()
+        return False
+
+
+# --------------------------------------------------------------------------
+# git helpers
+# --------------------------------------------------------------------------
+
+
+def git(args, cwd=None, timeout=GIT_TIMEOUT):
+    return run_command(["git", *args], cwd=cwd, timeout=timeout)
+
+
+def resolve_main_repo(worktree: str) -> tuple[str, str]:
+    ok, out, err = git(["-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if not ok:
+        return "", (err or "not a git worktree").strip().splitlines()[0]
+    common = out.strip()
+    if not common:
+        return "", "empty git common dir"
+    repo = os.path.dirname(common) if os.path.basename(common) == ".git" else common
+    return repo, ""
+
+
+def default_remote_ref(repo: str) -> tuple[str, str]:
+    """Resolve origin's default branch. Any ambiguity is an error, never a guess."""
+    ok, out, err = git(["-C", repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+    if ok and out.strip():
+        return out.strip(), ""
+    return "", "origin/HEAD is not set (run: git remote set-head origin -a)"
+
+
+def worktree_registry(repo: str) -> tuple[dict, str]:
+    """Parse `git worktree list --porcelain` into path -> {branch, head, locked, main}."""
+    ok, out, err = git(["-C", repo, "worktree", "list", "--porcelain"])
+    if not ok:
+        return {}, (err or "git worktree list failed").strip().splitlines()[0]
+    registry = {}
+    current = {}
+    first = True
+
+    def flush():
+        nonlocal current, first
+        if current.get("path"):
+            current["main"] = first
+            registry[current["path"]] = current
+            first = False
+        current = {}
+
+    for line in out.splitlines():
+        if not line.strip():
+            flush()
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            flush()
+            current = {"path": value, "branch": "", "head": "", "locked": False, "prunable": False}
+        elif key == "branch":
+            current["branch"] = value
+        elif key == "HEAD":
+            current["head"] = value
+        elif key == "locked":
+            current["locked"] = True
+            current["locked_reason"] = value
+        elif key == "prunable":
+            current["prunable"] = True
+            current["prunable_reason"] = value
+        elif key == "detached":
+            current["branch"] = ""
+    flush()
+    return registry, ""
+
+
+def git_status_entries(worktree: str) -> tuple[list, str]:
+    ok, out, err = git(["-C", worktree, "status", "--porcelain=v1", "--untracked-files=all"])
+    if not ok:
+        return [], (err or "git status failed").strip().splitlines()[0]
+    return [line for line in out.splitlines() if line.strip()], ""
+
+
+def git_ignored_paths(worktree: str) -> tuple[list, str]:
+    ok, out, err = git(
+        ["-C", worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"]
+    )
+    if not ok:
+        return [], (err or "git ls-files failed").strip().splitlines()[0]
+    return [line for line in out.splitlines() if line.strip()], ""
+
+
+def matches_protected_ignored(paths, globs) -> list:
+    """Return ignored entries that match a protected glob at any depth."""
+    hits = []
+    for entry in paths:
+        stripped = entry.rstrip("/")
+        segments = stripped.split("/")
+        for pattern in globs:
+            if fnmatch(stripped, pattern) or any(fnmatch(segment, pattern) for segment in segments):
+                hits.append(entry)
+                break
+    return hits
+
+
+def head_is_merged(repo: str, head: str, ref: str) -> tuple[bool, str]:
+    if not head or not ref:
+        return False, "missing head or remote ref"
+    ok, _, err = git(["-C", repo, "merge-base", "--is-ancestor", head, ref])
+    if ok:
+        return True, ""
+    message = (err or "").strip().splitlines()
+    if message:
+        return False, message[0]
+    return False, f"{head[:12]} is not an ancestor of {ref}"
+
+
+def fetch_repo(repo: str) -> tuple[bool, str]:
+    ok, _, err = git(["-C", repo, "fetch", "--quiet", "origin"], timeout=300)
+    if ok:
+        return True, ""
+    return False, (err or "git fetch failed").strip().splitlines()[-1] if (err or "").strip() else "git fetch failed"
+
+
+# --------------------------------------------------------------------------
+# measurement
+# --------------------------------------------------------------------------
+
+
+def measure_tree(path: str) -> tuple[int, int, list]:
+    """Count inodes and allocated bytes below path. Hardlinks counted once."""
+    inodes = 0
+    total_bytes = 0
+    seen = set()
+    errors = []
+    stack = [path]
+    try:
+        stat = os.lstat(path)
+        inodes += 1
+        total_bytes += stat.st_blocks * 512
+        seen.add((stat.st_dev, stat.st_ino))
+    except OSError as exc:
+        return 0, 0, [f"{path}: {exc}"]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        stat = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        errors.append(f"{entry.path}: {exc}")
+                        continue
+                    key = (stat.st_dev, stat.st_ino)
+                    if stat.st_nlink > 1:
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                    inodes += 1
+                    total_bytes += stat.st_blocks * 512
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+        except OSError as exc:
+            errors.append(f"{current}: {exc}")
+    return inodes, total_bytes, errors
+
+
+def fs_free_snapshot(path: str) -> tuple[dict | None, str]:
+    """Free inodes/bytes of the filesystem holding `path`, from statvfs.
+
+    f_ffree is the free inode count and f_bavail the blocks available to this
+    (unprivileged) user, so the byte figure excludes root-reserved space.
+    """
+    try:
+        stat = os.statvfs(path)
+    except OSError as exc:
+        return None, str(exc)
+    return {"free_inodes": stat.f_ffree, "free_bytes": stat.f_bavail * stat.f_frsize}, ""
+
+
+def snapshot_anchor(path: str) -> str:
+    """Stable path to statvfs: the worktree's parent, which outlives removal."""
+    parent = os.path.dirname(os.path.abspath(path).rstrip("/"))
+    return parent or "/"
+
+
+def newest_mtime(path: str) -> float:
+    """Newest mtime among the worktree dir and its immediate children."""
+    newest = 0.0
+    try:
+        newest = os.lstat(path).st_mtime
+    except OSError:
+        return 0.0
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return newest
+
+
+def head_commit_time(worktree: str) -> float:
+    ok, out, _ = git(["-C", worktree, "log", "-1", "--format=%ct", "HEAD"])
+    if not ok:
+        return 0.0
+    try:
+        return float(out.strip())
+    except ValueError:
+        return 0.0
+
+
+# --------------------------------------------------------------------------
+# evaluation
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class HostState:
+    processes: ProcessScan
+    listeners: ListenerScan
+    units: UnitScan
+    associations: dict
+    association_problems: list
+    fetched: dict = field(default_factory=dict)  # repo -> (ok, error)
+
+
+def collect_host_state(config: Config, fetch: bool, repos=None) -> HostState:
+    associations, problems = read_task_associations(config.root)
+    state = HostState(
+        processes=resolve_process_coverage(
+            scan_processes(), enabled=config.privileged_process_probe
+        ),
+        listeners=scan_listeners(),
+        units=scan_units(),
+        associations=associations,
+        association_problems=problems,
+    )
+    if fetch:
+        for repo in sorted(set(repos or [])):
+            state.fetched[repo] = fetch_repo(repo)
+    return state
+
+
+def evaluate_worktree(path: str, config: Config, state: HostState, self_path: str, fetch_required: bool,
+                      owned_locks=()) -> dict:
+    """Return a record with every blocker found. Empty blockers means eligible."""
+    record = {
+        "path": path,
+        "name": os.path.basename(path.rstrip("/")),
+        "branch": "",
+        "head": "",
+        "main_repo": "",
+        "remote_ref": "",
+        "age_days": None,
+        "tasks": [],
+        "inferred_task": "",
+        # Set only when neither an association nor a task-id inference exists
+        # and the basename itself had to stand in as the cleanup identity.
+        "cleanup_identity": "",
+        "blockers": [],
+        "notes": [],
+        "inodes": None,
+        "bytes": None,
+    }
+
+    def block(code: str, detail: str):
+        blocker = {"code": code, "detail": detail}
+        if blocker not in record["blockers"]:
+            record["blockers"].append(blocker)
+
+    try:
+        real_path = str(Path(path).resolve())
+    except OSError as exc:
+        block("path-unresolvable", str(exc))
+        return record
+    paths = {path.rstrip("/"), real_path}
+    record["real_path"] = real_path
+
+    # Never operate outside the managed worktrees directory, and never on self.
+    try:
+        worktrees_dir = str(config.worktrees_dir.resolve())
+    except OSError:
+        worktrees_dir = str(config.worktrees_dir)
+    if not (path_contains(str(config.worktrees_dir), path) or path_contains(worktrees_dir, real_path)):
+        block("outside-managed-root", f"not under {config.worktrees_dir}")
+    if self_path and any(path_contains(candidate, self_path) for candidate in paths):
+        block("self", "worktree-gc is running inside this worktree")
+
+    if paths & config.protected_worktree_paths:
+        block("protected-worktree", "listed in protected_worktrees")
+    if record["name"] in config.protected_worktrees:
+        block("protected-worktree", "listed in protected_worktrees")
+
+    if not os.path.isdir(path):
+        block("not-a-directory", "path is not a directory")
+        return record
+
+    # --- git identity -----------------------------------------------------
+    repo, repo_error = resolve_main_repo(path)
+    record["main_repo"] = repo
+    if repo_error:
+        block("not-a-worktree", repo_error)
+    registry, registry_error = ({}, "")
+    entry = None
+    if repo:
+        registry, registry_error = worktree_registry(repo)
+        if registry_error:
+            block("worktree-registry-unreadable", registry_error)
+        else:
+            for key, value in registry.items():
+                try:
+                    resolved = str(Path(key).resolve())
+                except OSError:
+                    resolved = key
+                if key.rstrip("/") in paths or resolved in paths:
+                    entry = value
+                    break
+            if entry is None:
+                block("not-registered", f"not listed by git worktree list in {repo}")
+            else:
+                record["branch"] = entry.get("branch", "").replace("refs/heads/", "")
+                record["head"] = entry.get("head", "")
+                if entry.get("main"):
+                    block("main-worktree", "this is the primary working tree")
+                if entry.get("locked"):
+                    block("worktree-locked", entry.get("locked_reason") or "git worktree is locked")
+
+    # --- working tree cleanliness ----------------------------------------
+    if repo:
+        entries, status_error = git_status_entries(path)
+        if status_error:
+            block("status-unknown", status_error)
+        elif entries:
+            preview = ", ".join(entry[:60] for entry in entries[:3])
+            block("dirty", f"{len(entries)} entries: {preview}")
+        ignored, ignored_error = git_ignored_paths(path)
+        if ignored_error:
+            block("ignored-scan-failed", ignored_error)
+        else:
+            protected = matches_protected_ignored(ignored, config.protected_ignored_globs)
+            if protected:
+                block("protected-ignored-state", ", ".join(sorted(protected)[:5]))
+            record["notes"].append(f"{len(ignored)} ignored top-level entries")
+
+    # --- merged into the remote default branch ---------------------------
+    if repo:
+        ref, ref_error = default_remote_ref(repo)
+        record["remote_ref"] = ref
+        if ref_error:
+            block("remote-default-ambiguous", ref_error)
+        else:
+            fetched = state.fetched.get(repo)
+            if fetched is None:
+                if fetch_required:
+                    block("remote-refs-not-fetched", "no fetch performed for this repository")
+                else:
+                    record["notes"].append("reachability computed from cached remote refs (no fetch)")
+            elif not fetched[0]:
+                block("fetch-failed", fetched[1])
+            head = record["head"] or ""
+            if not head:
+                ok, out, _ = git(["-C", path, "rev-parse", "HEAD"])
+                head = out.strip() if ok else ""
+                record["head"] = head
+            if not head:
+                block("head-unknown", "cannot resolve HEAD")
+            else:
+                merged, reason = head_is_merged(repo, head, ref)
+                if not merged:
+                    block("not-merged", reason or f"HEAD not reachable from {ref}")
+
+    # --- age --------------------------------------------------------------
+    timestamps = []
+    mtime = newest_mtime(path)
+    if mtime:
+        timestamps.append(mtime)
+    commit_time = head_commit_time(path)
+    if commit_time:
+        timestamps.append(commit_time)
+    for association in state.associations.get(real_path, []) + state.associations.get(path.rstrip("/"), []):
+        try:
+            timestamps.append(os.path.getmtime(association.source))
+        except OSError:
+            continue
+    if not timestamps:
+        block("age-unknown", "no usable timestamp for this worktree")
+    else:
+        age_days = (now() - max(timestamps)) / 86400.0
+        record["age_days"] = round(age_days, 2)
+        if age_days < config.min_age_days:
+            block("too-recent", f"{age_days:.2f}d < {config.min_age_days:.2f}d minimum")
+
+    # --- live usage -------------------------------------------------------
+    if state.processes.error:
+        block("process-scan-failed", state.processes.error)
+    # Fail closed: while any pid's references are unknown, the absence of a cwd
+    # or an open writer inside this candidate is unproven, so it may not be
+    # removed. The inventory still reports every other finding for it.
+    if state.processes.uncovered_pids:
+        # Host-wide condition: the offending pids are listed once, in the report
+        # header, rather than repeated under every worktree.
+        block(
+            "process-coverage-incomplete",
+            f"{len(state.processes.uncovered_pids)} pid(s) uninspectable, so cwd/open-writer "
+            f"absence is unproven ({state.processes.probe or 'no privileged probe'})",
+        )
+    # Paranoid mode: block even when the probe proved absence, on the grounds
+    # that some pid was not directly readable by this user at all.
+    if config.strict_process_scan and state.processes.probe not in ("", "not needed"):
+        block("process-scan-incomplete", f"strict mode: {state.processes.probe}")
+    argv_hits = restricted_processes_naming(state.processes, paths)
+    if argv_hits:
+        block("in-use-by-process", "; ".join(argv_hits[:3]))
+    holders = processes_using(state.processes, paths)
+    if holders:
+        block("in-use-by-process", "; ".join(holders[:3]))
+
+    if state.listeners.error:
+        block("listener-scan-failed", state.listeners.error)
+    else:
+        listener_hits = []
+        for pid in sorted(state.listeners.pids, key=int):
+            references = state.processes.holders.get(pid, [])
+            if any(any(path_contains(candidate, target) for candidate in paths) for _, target, _ in references):
+                listener_hits.append(f"pid {pid}: {state.listeners.details.get(pid, 'listener')}")
+        if listener_hits:
+            block("listener-attached", "; ".join(listener_hits[:3]))
+
+    if state.units.error:
+        block("unit-scan-failed", state.units.error)
+    else:
+        unit_hits = units_referencing(state.units, paths)
+        if unit_hits:
+            block("systemd-unit-associated", ", ".join(unit_hits[:5]))
+
+    # --- agent-task associations -----------------------------------------
+    for problem in state.association_problems:
+        block("task-metadata-unreadable", problem)
+    associations = {
+        (association.issue, association.source): association
+        for key in paths
+        for association in state.associations.get(key, [])
+    }
+    for association in associations.values():
+        record["tasks"].append(
+            {"issue": association.issue, "source": association.source, "in_flight": association.in_flight,
+             "detail": association.detail}
+        )
+        if association.in_flight:
+            block("task-in-flight", f"{association.issue}: {association.detail}")
+        # Local run metadata only describes the last local execution. It says
+        # nothing about the task's real lifecycle on the board, so a terminal or
+        # missing local run never authorises removal on its own: the external
+        # state is unknown until a human records it here.
+        if slugify(association.issue) not in config.approved_task_slugs:
+            block(
+                "task-cleanup-not-approved",
+                f"{association.issue}: external task state unknown "
+                f"(local run: {association.detail}); add it to task_cleanup_approved "
+                "once the board shows it completed / approved for cleanup",
+            )
+        if slugify(association.issue) in config.protected_task_slugs:
+            block("protected-task", association.issue)
+
+    # A worktree *named* after a Kanban task belongs to that task whether or not
+    # any local metadata survives. Deleting artifacts/runs (or never writing
+    # them) must not silently drop the external-state gate for it, so the task
+    # id is inferred from the basename and required in task_cleanup_approved
+    # exactly like an artifact-derived association.
+    inferred = task_id_from_worktree_name(record["name"])
+    record["inferred_task"] = inferred
+    if inferred and slugify(inferred) not in {
+        slugify(association.issue) for association in associations.values()
+    }:
+        record["tasks"].append(
+            {"issue": inferred, "source": "worktree-name", "in_flight": False,
+             "detail": f"inferred from worktree name {record['name']}; "
+                       "no local run metadata for this task"}
+        )
+        if slugify(inferred) not in config.approved_task_slugs:
+            block(
+                "task-cleanup-not-approved",
+                f"{inferred}: external task state unknown (task id inferred from worktree "
+                f"name {record['name']}; no local run metadata for this task); add it to "
+                "task_cleanup_approved once the board shows it completed / approved for cleanup",
+            )
+        if slugify(inferred) in config.protected_task_slugs:
+            block("protected-task", inferred)
+
+    # Everything else. Only `t_<hex>` is inferable as a Kanban id, but agent
+    # tasks are just as often named `SK-123`, `SPOT-123`, `SAL-45`, an
+    # arbitrary task key, or a topic - and any of those can lose its
+    # artifacts/runs metadata, or never have had any. Those worktrees must not
+    # fall out of the external-state gate merely because nothing local names
+    # them, so the basename itself becomes the cleanup identity and has to be
+    # approved verbatim.
+    #
+    # This is deliberately conservative for topic and legacy directories: the
+    # operator checks who owns that exact directory once, approves that exact
+    # name, and nothing else is covered by it. `--approve` alone can never
+    # make a candidate with an unknown association eligible.
+    if not associations and not inferred:
+        name = record["name"]
+        if not name:
+            block("worktree-cleanup-not-approved", "no basename to attribute cleanup to")
+        else:
+            record["cleanup_identity"] = name
+            record["tasks"].append(
+                {"issue": name, "source": "worktree-name-fallback", "in_flight": False,
+                 "detail": f"no task association and no inferable task id for {name}; "
+                           "the worktree name is the cleanup identity"}
+            )
+            if name not in config.approved_cleanup_names:
+                block(
+                    "worktree-cleanup-not-approved",
+                    f"{name}: no task association and no inferable task id, so the external "
+                    f"state of this worktree is unknown; add the exact name {name!r} to "
+                    "task_cleanup_approved once you have checked what owns it",
+                )
+
+    if record["name"] and slugify(record["name"]) in config.protected_task_slugs:
+        block("protected-task", record["name"])
+
+    held, lock_detail = lock_is_held(config.root, path, owned=owned_locks)
+    if held:
+        block("worktree-lock-held", lock_detail)
+
+    record["eligible"] = not record["blockers"]
+    return record
+
+
+def discover_worktrees(config: Config, only=None) -> list:
+    if only:
+        return [str(Path(os.path.expanduser(path)).absolute()) for path in only]
+    directory = config.worktrees_dir
+    if not directory.is_dir():
+        die(f"worktrees directory not found: {directory}")
+    entries = []
+    with os.scandir(directory) as scan:
+        for entry in scan:
+            if entry.is_dir(follow_symlinks=False):
+                entries.append(entry.path)
+    return sorted(entries)
+
+
+def build_report(config: Config, only, measure: str, fetch: bool, fetch_required: bool,
+                 owned_locks=()) -> dict:
+    paths = discover_worktrees(config, only)
+    self_path = ""
+    try:
+        self_path = str(Path.cwd())
+    except OSError:
+        self_path = ""
+
+    repos = []
+    if fetch:
+        for path in paths:
+            repo, _ = resolve_main_repo(path)
+            if repo:
+                repos.append(repo)
+    state = collect_host_state(config, fetch, repos)
+
+    records = [
+        evaluate_worktree(path, config, state, self_path, fetch_required, owned_locks=owned_locks)
+        for path in paths
+    ]
+
+    for record in records:
+        if measure == "all" or (measure == "eligible" and record.get("eligible")):
+            inodes, size, errors = measure_tree(record["path"])
+            record["inodes"] = inodes
+            record["bytes"] = size
+            if errors:
+                record["notes"].append(f"measurement skipped {len(errors)} entries")
+
+    eligible = [record for record in records if record.get("eligible")]
+    return {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "root": str(config.root),
+        "min_age_days": config.min_age_days,
+        "fetched": {repo: {"ok": ok, "error": error} for repo, (ok, error) in state.fetched.items()},
+        "config_path": config.config_path,
+        "config_warnings": config.config_errors,
+        "host": {
+            "unreadable_foreign_pids": len(state.processes.unreadable_foreign_pids),
+            "argv_only_own_pids": len(state.processes.restricted),
+            "uncovered_pids": len(state.processes.uncovered_pids),
+            "uncovered_pid_sample": [
+                f"pid {pid}: {state.processes.uncovered_pids[pid]}"
+                for pid in sorted(state.processes.uncovered_pids, key=int)[:5]
+            ],
+            "process_coverage_complete": state.processes.coverage_complete,
+            "privileged_probe": state.processes.probe,
+            "process_scan_error": state.processes.error,
+            "listener_scan_error": state.listeners.error,
+            "unit_scan_error": state.units.error,
+        },
+        "worktrees": records,
+        "summary": {
+            "total": len(records),
+            "eligible": len(eligible),
+            "blocked": len(records) - len(eligible),
+            "projected_inodes": sum(record["inodes"] or 0 for record in eligible),
+            "projected_bytes": sum(record["bytes"] or 0 for record in eligible),
+        },
+    }
+
+
+def print_report(report: dict, verbose: bool) -> None:
+    print("== worktree-gc inventory (dry-run, read-only) ==")
+    print(f"Root: {report['root']}   Min age: {report['min_age_days']}d   Generated: {report['generated_at']}")
+    if report["config_path"]:
+        print(f"Config: {report['config_path']}")
+    for warning in report["config_warnings"]:
+        print(f"WARN: {warning}")
+    host = report["host"]
+    for key in ("process_scan_error", "listener_scan_error", "unit_scan_error"):
+        if host[key]:
+            print(f"WARN: {key}: {host[key]}")
+    if host["privileged_probe"] and host["privileged_probe"] != "not needed":
+        print(f"PROCESS COVERAGE: {host['privileged_probe']}")
+    if not host["process_coverage_complete"]:
+        print(
+            f"WARN: {host['uncovered_pids']} process(es) could not be inspected "
+            f"({host['unreadable_foreign_pids']} foreign-uid, {host['argv_only_own_pids']} "
+            "non-dumpable own). Removal is blocked while their references are unknown."
+        )
+        for sample in host["uncovered_pid_sample"]:
+            print(f"      {sample}")
+    for repo, result in sorted(report["fetched"].items()):
+        print(f"FETCH: {repo}: {'ok' if result['ok'] else 'FAILED: ' + result['error']}")
+    print("")
+    for record in report["worktrees"]:
+        status = "ELIGIBLE" if record.get("eligible") else "BLOCKED "
+        age = f"{record['age_days']}d" if record["age_days"] is not None else "unknown"
+        size = ""
+        if record["inodes"] is not None:
+            size = f" inodes={record['inodes']} size={human_bytes(record['bytes'] or 0)}"
+        print(f"{status} {record['name']}  branch={record['branch'] or '-'} age={age}{size}")
+        if record.get("eligible") or verbose:
+            for task in record["tasks"]:
+                print(f"    task: {task['issue']} ({task['detail']})")
+        for blocker in record["blockers"]:
+            print(f"    blocker: {blocker['code']}: {blocker['detail']}")
+        if verbose:
+            for note in record["notes"]:
+                print(f"    note: {note}")
+    summary = report["summary"]
+    print("")
+    print(
+        f"Total: {summary['total']}  eligible: {summary['eligible']}  blocked: {summary['blocked']}"
+    )
+    print(
+        f"Projected reclaim (ESTIMATE from measured tree size): "
+        f"{summary['projected_inodes']} inodes, {human_bytes(summary['projected_bytes'])}"
+    )
+    print("No worktree was modified. Removal requires: worktree-gc collect --approve")
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+
+def command_inventory(args) -> int:
+    config = build_config(args)
+    report = build_report(config, args.worktree, args.measure, fetch=args.fetch, fetch_required=False)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print_report(report, args.verbose)
+    return EXIT_OK
+
+
+def remove_worktree(repo: str, path: str) -> tuple[bool, str]:
+    """Plain `git worktree remove`. Never --force: git refuses unsafe removals."""
+    ok, _, err = git(["-C", repo, "worktree", "remove", path])
+    if not ok:
+        message = (err or "git worktree remove failed").strip().splitlines()
+        return False, message[-1] if message else "git worktree remove failed"
+    if os.path.exists(path):
+        return False, "git reported success but the path still exists"
+    return True, ""
+
+
+def command_collect(args) -> int:
+    config = build_config(args)
+    # Removal always requires fresh remote refs; inventory may run without.
+    report = build_report(config, args.worktree, args.measure, fetch=True, fetch_required=True)
+    eligible = [record for record in report["worktrees"] if record.get("eligible")]
+
+    print_report(report, args.verbose)
+    print("")
+    if not args.approve:
+        print("DRY-RUN: --approve was not supplied, so nothing was removed.")
+        print(f"Would remove {len(eligible)} worktree(s) with plain `git worktree remove`.")
+        return EXIT_OK
+
+    print(f"== worktree-gc collect (APPROVED) == {len(eligible)} candidate(s)")
+    removed = []
+    failed = []
+    state_paths = [record["path"] for record in eligible]
+    for path in state_paths:
+        # Take the exact agent-task per-worktree flock BEFORE the final
+        # evaluation and keep it until `git worktree remove` has returned. No
+        # agent-task run can start inside that window, which is what closes the
+        # time-of-check/time-of-use race. Failing to take it means someone else
+        # holds it: skip, never force.
+        guard = WorktreeLockGuard(config.root, path)
+        acquired, lock_error = guard.acquire()
+        if not acquired:
+            failed.append((path, f"lock unavailable: {lock_error}"))
+            print(f"SKIP {path}: could not take the worktree lock ({lock_error})")
+            continue
+        try:
+            # Expensive work first, still under the lock. Walking a large tree
+            # takes seconds; doing it before the final recheck keeps it out of
+            # the recheck-to-removal window instead of stretching that window by
+            # its whole duration. This measurement is an ESTIMATE of what the
+            # removal should free - the observed figures below come from statvfs
+            # snapshots taken immediately before and after `git worktree remove`.
+            estimated_inodes, estimated_bytes, _ = measure_tree(path)
+            # Final recheck, immediately before the snapshot and the removal.
+            # origin is fetched again and freshness is required: the plan's
+            # reachability proof can be invalidated between planning and now by
+            # a force-push or a moved default branch, so it is re-established
+            # rather than reused. No blocker is filtered out here.
+            fresh = build_report(
+                config, [path], "none", fetch=True, fetch_required=True,
+                owned_locks=guard.lock_files,
+            )
+            record = fresh["worktrees"][0]
+            if record["blockers"]:
+                failed.append((path, "recheck blocked: " + record["blockers"][0]["code"]))
+                print(f"SKIP {path}: recheck blocked ({record['blockers'][0]['code']})")
+                continue
+            anchor = snapshot_anchor(path)
+            before, before_error = fs_free_snapshot(anchor)
+            ok, error = remove_worktree(record["main_repo"], path)
+            after, after_error = fs_free_snapshot(anchor) if ok else (None, "")
+        finally:
+            guard.release()
+        if not ok:
+            failed.append((path, error))
+            print(f"FAILED {path}: {error}")
+            continue
+
+        entry = {
+            "path": path,
+            "branch": record["branch"],
+            "estimated_inodes": estimated_inodes,
+            "estimated_bytes": estimated_bytes,
+            "observed_free_inode_delta": None,
+            "observed_free_bytes_delta": None,
+            "observed_error": "",
+            "statvfs_anchor": anchor,
+        }
+        if before and after:
+            # Raw deltas, never clamped: a negative value means concurrent
+            # filesystem activity allocated more than this removal freed.
+            entry["observed_free_inode_delta"] = after["free_inodes"] - before["free_inodes"]
+            entry["observed_free_bytes_delta"] = after["free_bytes"] - before["free_bytes"]
+        else:
+            entry["observed_error"] = before_error or after_error or "statvfs unavailable"
+        removed.append(entry)
+
+        observed = (
+            f"observed free-space delta {entry['observed_free_inode_delta']} inodes, "
+            f"{signed_bytes(entry['observed_free_bytes_delta'])}"
+            if entry["observed_free_inode_delta"] is not None
+            else f"observed delta unavailable ({entry['observed_error']})"
+        )
+        print(
+            f"REMOVED {path}  estimated tree {estimated_inodes} inodes, "
+            f"{human_bytes(estimated_bytes)}; {observed} "
+            f"(branch {record['branch'] or '-'} kept)"
+        )
+
+    total_estimated_inodes = sum(item["estimated_inodes"] for item in removed)
+    total_estimated_bytes = sum(item["estimated_bytes"] for item in removed)
+    observed_entries = [item for item in removed if item["observed_free_inode_delta"] is not None]
+    observed_inode_delta = sum(item["observed_free_inode_delta"] for item in observed_entries)
+    observed_bytes_delta = sum(item["observed_free_bytes_delta"] for item in observed_entries)
+    unobserved = len(removed) - len(observed_entries)
+
+    print("")
+    print(
+        f"Removed {len(removed)} worktree(s); estimated tree size "
+        f"{total_estimated_inodes} inodes, {human_bytes(total_estimated_bytes)}"
+    )
+    print(
+        f"Observed free-space delta (statvfs f_ffree/f_bavail, {len(observed_entries)}"
+        f"/{len(removed)} removals sampled): {observed_inode_delta} inodes, "
+        f"{signed_bytes(observed_bytes_delta)}"
+    )
+    if unobserved:
+        print(f"NOTE: {unobserved} removal(s) had no usable statvfs sample; excluded from the observed totals")
+    print(
+        "NOTE: estimates are pre-removal tree measurements, not reclaim. Observed deltas are "
+        "whole-filesystem and include any concurrent activity, so they may under- or overstate "
+        "this run's reclaim and can be negative."
+    )
+    print(f"Failed/skipped: {len(failed)}")
+    if args.json:
+        print(json.dumps({
+            "removed": removed,
+            "failed": [{"path": p, "error": e} for p, e in failed],
+            "estimated_inodes": total_estimated_inodes,
+            "estimated_bytes": total_estimated_bytes,
+            "observed_free_inode_delta": observed_inode_delta,
+            "observed_free_bytes_delta": observed_bytes_delta,
+            "observed_samples": len(observed_entries),
+            "observed_unavailable": unobserved,
+            "observed_delta_caveat": (
+                "Observed deltas are filesystem-wide statvfs differences (f_ffree / "
+                "f_bavail * f_frsize) taken immediately before and after each git worktree "
+                "remove. Concurrent filesystem activity is included; values are reported raw "
+                "and may be negative."
+            ),
+        }, indent=2))
+    return EXIT_FAILURE if failed else EXIT_OK
+
+
+def inode_status(path: str) -> tuple[dict, str]:
+    try:
+        stat = os.statvfs(path)
+    except OSError as exc:
+        return {}, str(exc)
+    if stat.f_files <= 0:
+        return {}, "filesystem does not report inode counts"
+    inode_used = stat.f_files - stat.f_ffree
+    block_total = stat.f_blocks
+    block_used = block_total - stat.f_bfree
+    return (
+        {
+            "path": path,
+            "inodes_total": stat.f_files,
+            "inodes_used": inode_used,
+            "inodes_free": stat.f_ffree,
+            "inodes_used_percent": round(inode_used * 100.0 / stat.f_files, 2),
+            "bytes_total": block_total * stat.f_frsize,
+            "bytes_used": block_used * stat.f_frsize,
+            "bytes_free": stat.f_bavail * stat.f_frsize,
+            "bytes_used_percent": round(block_used * 100.0 / block_total, 2) if block_total else 0.0,
+        },
+        "",
+    )
+
+
+def command_inode_check(args) -> int:
+    config = build_config(args)
+    if config.warn_percent > config.critical_percent:
+        print("UNKNOWN: warn threshold is above critical threshold", file=sys.stderr)
+        return CHECK_UNKNOWN
+    target = args.path or str(config.root)
+    status, error = inode_status(target)
+    if error:
+        print(f"UNKNOWN: inode-check {target}: {error}", file=sys.stderr)
+        return CHECK_UNKNOWN
+
+    worst = max(status["inodes_used_percent"], status["bytes_used_percent"])
+    if worst >= config.critical_percent:
+        level, code = "CRITICAL", CHECK_CRITICAL
+    elif worst >= config.warn_percent:
+        level, code = "WARN", CHECK_WARN
+    else:
+        level, code = "OK", CHECK_OK
+
+    if args.json:
+        print(json.dumps({**status, "level": level, "exit_code": code,
+                          "warn_percent": config.warn_percent,
+                          "critical_percent": config.critical_percent}, indent=2, sort_keys=True))
+        return code
+
+    line = (
+        f"{level}: inode-check {target} - inodes {status['inodes_used_percent']}% used "
+        f"({status['inodes_free']} free), space {status['bytes_used_percent']}% used "
+        f"({human_bytes(status['bytes_free'])} free), thresholds "
+        f"{config.warn_percent}/{config.critical_percent}"
+    )
+    if code == CHECK_OK and args.quiet:
+        return code
+    print(line, file=sys.stderr if code != CHECK_OK else sys.stdout)
+    return code
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="worktree-gc",
+        description="Conservative worktree retention inventory and gated garbage collection.",
+        epilog=(
+            "worktree-gc inventory        read-only report (default command)\n"
+            "worktree-gc collect          plan removals; --approve to delete\n"
+            "worktree-gc inode-check      monitoring check: 0 ok, 1 warn, 2 critical, 3 unknown"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--root",
+        default=os.environ.get("AGENT_WORKSTATION_ROOT", os.path.expanduser("~/agent-workstation")),
+        help="workstation root (default: $AGENT_WORKSTATION_ROOT or ~/agent-workstation)",
+    )
+    parser.add_argument("--config", help="JSON config file (default: <root>/config/worktree-gc.json)")
+    subparsers = parser.add_subparsers(dest="command")
+
+    def add_shared(sub):
+        sub.add_argument("--min-age-days", type=float, help="minimum age before a worktree may be removed")
+        sub.add_argument("--protect-worktree", action="append", help="never remove this worktree (repeatable)")
+        sub.add_argument("--protect-task", action="append", help="never remove worktrees for this task (repeatable)")
+        sub.add_argument("--protect-ignored-glob", action="append",
+                         help="ignored-file glob that blocks removal (repeatable)")
+        sub.add_argument("--worktree", action="append", help="limit to this worktree path (repeatable)")
+        sub.add_argument("--measure", choices=("none", "eligible", "all"), default="eligible",
+                         help="measure inode/byte usage for: none, eligible worktrees (default), all")
+        sub.add_argument("--approve-task-cleanup", action="append",
+                         help="task whose EXTERNAL state you confirmed completed/cleanup-approved "
+                              "(repeatable); worktrees associated with the task, or named after it "
+                              "(t_35c15c8a, t_35c15c8a-revert), are blocked without it. A worktree "
+                              "with neither an association nor an inferable task id is gated on its "
+                              "exact basename (SK-123, a topic name), matched verbatim")
+        sub.add_argument("--strict-process-scan", action="store_true",
+                         help="block every removal whenever any process needed the privileged probe")
+        sub.add_argument("--no-privileged-process-probe", action="store_true",
+                         help="do not attempt the read-only sudo -n probe of uninspectable pids")
+        sub.add_argument("--json", action="store_true", help="emit JSON")
+        sub.add_argument("--verbose", action="store_true", help="show notes and task details for all worktrees")
+
+    inventory = subparsers.add_parser("inventory", help="read-only eligibility report")
+    add_shared(inventory)
+    inventory.add_argument("--fetch", action="store_true",
+                           help="refresh origin refs first (off by default to keep inventory local)")
+    inventory.set_defaults(func=command_inventory)
+
+    collect = subparsers.add_parser("collect", help="plan removals; deletes only with --approve")
+    add_shared(collect)
+    collect.add_argument("--approve", action="store_true",
+                         help="MANUAL APPROVAL: actually run git worktree remove on eligible "
+                              "worktrees. Not sufficient on its own - it supplies no cleanup "
+                              "identity, so every managed worktree also needs its task id or "
+                              "exact basename passed to --approve-task-cleanup (or listed in "
+                              "task_cleanup_approved)")
+    collect.set_defaults(func=command_collect, fetch=True)
+
+    check = subparsers.add_parser("inode-check", help="inode/space threshold check for monitoring")
+    check.add_argument("--path", help="filesystem path to check (default: workstation root)")
+    check.add_argument("--warn-percent", type=float, help="warn threshold (default 80)")
+    check.add_argument("--critical-percent", type=float, help="critical threshold (default 90)")
+    check.add_argument("--quiet", action="store_true", help="print nothing while OK")
+    check.add_argument("--json", action="store_true", help="emit JSON")
+    check.set_defaults(func=command_inode_check)
+    return parser
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    commands = {"inventory", "collect", "inode-check"}
+    if not any(token in commands for token in argv) and not ({"-h", "--help"} & set(argv)):
+        argv = [*argv, "inventory"]
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return EXIT_USAGE
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
