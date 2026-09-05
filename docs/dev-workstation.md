@@ -61,7 +61,9 @@ Every safety predicate fails closed, local branches and commits are preserved,
 and `--approve` must never be scheduled. Three gates in particular are strict:
 a worktree stays blocked while any process's `/proc` references are unreadable,
 a task-associated worktree needs its external board state recorded in
-`task_cleanup_approved`, and `collect --approve` holds the `agent-task`
+`task_cleanup_approved` — including a worktree associated only by being named
+after a Kanban task (`t_35c15c8a`, `t_3626513e-revert`), whose local metadata
+may be missing entirely — and `collect --approve` holds the `agent-task`
 per-worktree flock from the final check until after `git worktree remove`. See
 [Worktree retention and inode pressure](worktree-retention.md) for the full
 blocker list, configuration, monitoring setup, and rollout policy.

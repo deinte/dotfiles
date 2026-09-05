@@ -62,6 +62,28 @@ class PurePredicateTest(unittest.TestCase):
                 capture_output=True, text=True, check=True).stdout.strip("\n")
             self.assertEqual(gc.slugify(value), shell, value)
 
+    def test_task_id_is_inferred_from_a_task_named_worktree(self):
+        # The live counterexample: basename is the Kanban task id itself.
+        self.assertEqual(gc.task_id_from_worktree_name("t_35c15c8a"), "t_35c15c8a")
+        # Suffix worktrees belong to the task they are named after.
+        self.assertEqual(gc.task_id_from_worktree_name("t_3626513e-revert"), "t_3626513e")
+        self.assertEqual(gc.task_id_from_worktree_name("t_69b6784b-di"), "t_69b6784b")
+        self.assertEqual(gc.task_id_from_worktree_name("t_3626513e_revert"), "t_3626513e")
+        self.assertEqual(gc.task_id_from_worktree_name("T_3626513E-Revert"), "t_3626513e")
+
+    def test_task_id_inference_does_not_collide_on_prefixes(self):
+        # A longer hex run is its own task, never the shorter one's suffix
+        # worktree: the hex is greedy and the whole basename must match.
+        self.assertEqual(gc.task_id_from_worktree_name("t_3626513eab"), "t_3626513eab")
+        self.assertNotEqual(gc.task_id_from_worktree_name("t_3626513eab"), "t_3626513e")
+        self.assertNotEqual(gc.task_id_from_worktree_name("t_3626513e"), "t_3626513")
+
+    def test_non_task_worktree_names_are_not_recognised(self):
+        # Unrecognised names keep the existing manual worktree-level path.
+        for name in ("SPOT-123", "AE-V2-LAUNCH-READINESS", "marvino-demo-t_93841552",
+                     "antwerpexpats-v2-t_92fe2b77", "t-b3824a2f-di", "t_", "t_zzzz", "tasks"):
+            self.assertEqual(gc.task_id_from_worktree_name(name), "", name)
+
     def test_path_contains(self):
         self.assertTrue(gc.path_contains("/a/b", "/a/b"))
         self.assertTrue(gc.path_contains("/a/b", "/a/b/c"))
@@ -807,6 +829,114 @@ class EndToEndTest(unittest.TestCase):
             "inventory", "--json", "--min-age-days", "0", "--approve-task-cleanup", "BOTH-1"
         )
         self.assertEqual(self.blockers(json.loads(text), "both"), {"task-in-flight"})
+
+    # --- task-named worktrees without any local metadata ----------------
+    # Regression for the live counterexample: worktree t_35c15c8a reported
+    # tasks: [] because its artifacts/runs metadata was absent, while Kanban
+    # task t_35c15c8a was still blocked. Missing metadata must not drop the
+    # external-state gate for a worktree that is named after a task.
+
+    def test_task_named_worktree_without_metadata_is_blocked(self):
+        self.fixture.add_worktree("t_35c15c8a", "feature/t_35c15c8a")
+        report = self.report()
+        record = self.record(report, "t_35c15c8a")
+        # No artifact/run file associates this worktree with anything; the gate
+        # now comes from the name alone.
+        self.assertEqual([task["source"] for task in record["tasks"]], ["worktree-name"])
+        self.assertEqual(self.blockers(report, "t_35c15c8a"), {"task-cleanup-not-approved"})
+        self.assertFalse(record["eligible"])
+
+    def test_task_named_worktree_without_metadata_reports_the_inferred_task(self):
+        self.fixture.add_worktree("t_35c15c8a", "feature/t_35c15c8a")
+        record = self.record(self.report(), "t_35c15c8a")
+        self.assertEqual(record["inferred_task"], "t_35c15c8a")
+        self.assertEqual([task["issue"] for task in record["tasks"]], ["t_35c15c8a"])
+        self.assertEqual(record["tasks"][0]["source"], "worktree-name")
+        self.assertFalse(record["tasks"][0]["in_flight"])
+
+    def test_approving_the_inferred_task_clears_the_external_state_gate(self):
+        self.fixture.add_worktree("t_35c15c8a", "feature/t_35c15c8a")
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0", "--approve-task-cleanup", "t_35c15c8a"
+        )
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.blockers(json.loads(text), "t_35c15c8a"), set())
+
+    def test_approval_reaches_recognised_suffix_worktrees_of_the_same_task(self):
+        self.fixture.add_worktree("t_3626513e", "feature/t_3626513e")
+        self.fixture.add_worktree("t_3626513e-revert", "feature/t_3626513e-revert")
+        report = self.report()
+        for name in ("t_3626513e", "t_3626513e-revert"):
+            self.assertEqual(self.blockers(report, name), {"task-cleanup-not-approved"}, name)
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0", "--approve-task-cleanup", "t_3626513e"
+        )
+        approved = json.loads(text)
+        self.assertEqual(self.record(approved, "t_3626513e-revert")["inferred_task"], "t_3626513e")
+        for name in ("t_3626513e", "t_3626513e-revert"):
+            self.assertEqual(self.blockers(approved, name), set(), name)
+
+    def test_approval_does_not_leak_to_prefix_collision_task_ids(self):
+        self.fixture.add_worktree("t_3626513eab", "feature/t_3626513eab")
+        self.fixture.add_worktree("t_3626513", "feature/t_3626513")
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0", "--approve-task-cleanup", "t_3626513e"
+        )
+        report = json.loads(text)
+        for name in ("t_3626513eab", "t_3626513"):
+            self.assertEqual(self.blockers(report, name), {"task-cleanup-not-approved"}, name)
+
+    def test_config_approval_also_clears_the_inferred_task_gate(self):
+        self.fixture.add_worktree("t_35c15c8a", "feature/t_35c15c8a")
+        (self.fixture.root / "config" / "worktree-gc.json").write_text(
+            json.dumps({"task_cleanup_approved": ["t_35c15c8a"]})
+        )
+        self.assertEqual(self.blockers(self.report(), "t_35c15c8a"), set())
+
+    def test_inferred_task_is_not_duplicated_when_metadata_exists(self):
+        self._task_worktree("t_35c15c8a", "t_35c15c8a")
+        record = self.record(self.report(), "t_35c15c8a")
+        self.assertEqual([task["issue"] for task in record["tasks"]], ["t_35c15c8a"])
+        self.assertEqual(record["tasks"][0]["source"].endswith("run.json"), True)
+
+    def test_inferred_task_is_added_alongside_an_unrelated_association(self):
+        """A named issue association and a task-named worktree both gate."""
+        self._task_worktree("t_35c15c8a", "SPOT-123")
+        report = self.report()
+        record = self.record(report, "t_35c15c8a")
+        self.assertEqual(
+            sorted(task["issue"] for task in record["tasks"]), ["SPOT-123", "t_35c15c8a"]
+        )
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0", "--approve-task-cleanup", "SPOT-123"
+        )
+        self.assertEqual(self.blockers(json.loads(text), "t_35c15c8a"), {"task-cleanup-not-approved"})
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0",
+            "--approve-task-cleanup", "SPOT-123", "--approve-task-cleanup", "t_35c15c8a",
+        )
+        self.assertEqual(self.blockers(json.loads(text), "t_35c15c8a"), set())
+
+    def test_protected_task_also_covers_a_recognised_suffix_worktree(self):
+        self.fixture.add_worktree("t_3626513e-revert", "feature/t_3626513e-revert")
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0", "--protect-task", "t_3626513e"
+        )
+        self.assertIn("protected-task", self.blockers(json.loads(text), "t_3626513e-revert"))
+
+    def test_unrecognised_worktree_name_keeps_the_manual_review_path(self):
+        """Documented boundary: names that only contain a task id are not inferred."""
+        self.fixture.add_worktree("marvino-demo-t_93841552", "feature/marvino")
+        report = self.report()
+        self.assertEqual(self.record(report, "marvino-demo-t_93841552")["inferred_task"], "")
+        self.assertEqual(self.blockers(report, "marvino-demo-t_93841552"), set())
+
+    def test_collect_approve_refuses_a_task_named_worktree_without_approval(self):
+        path = self.fixture.add_worktree("t_35c15c8a", "feature/t_35c15c8a")
+        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        self.assertTrue(path.is_dir(), text)
+        self.assertIn("task-cleanup-not-approved", text)
+        self.assertNotIn("REMOVED", text)
 
     def test_approving_a_protected_task_is_a_usage_error(self):
         code, text = self.run_cli(

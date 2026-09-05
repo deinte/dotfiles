@@ -11,7 +11,9 @@ removed. In particular:
     actually holds;
   * local agent-task metadata never authorises removal on its own - a
     task-associated worktree needs its external (board) state recorded in
-    task_cleanup_approved;
+    task_cleanup_approved, and a worktree *named* after a Kanban task
+    (t_35c15c8a, t_3626513e-revert) needs it even when that metadata is
+    missing entirely;
   * `collect --approve` holds the agent-task per-worktree flock from before the
     final evaluation until after `git worktree remove` returns, so no run can
     start in the check-to-delete window.
@@ -106,6 +108,30 @@ def slugify(value: str) -> str:
     lowered = value.lower()
     squeezed = re.sub(r"[^a-z0-9]+", "-", lowered)
     return squeezed.strip("-")[:48]
+
+
+# A worktree named after a Kanban task, optionally with a purpose suffix:
+# `t_3626513e`, `t_3626513e-revert`. The whole basename must match and the hex
+# run is greedy, so `t_3626513eab` infers itself rather than `t_3626513e`, and
+# neither `t_3626513` nor `t_3626513e` can stand in for the other.
+TASK_WORKTREE_NAME_RE = re.compile(r"^(t_[0-9a-f]+)(?:[-_].*)?$", re.IGNORECASE)
+
+
+def task_id_from_worktree_name(name: str) -> str:
+    """Infer the Kanban task a worktree belongs to from its basename alone.
+
+    Local `artifacts/*/run.json` and `runs/*.env` metadata can be deleted or
+    never written, so it cannot be the only thing that ties a worktree to a
+    task. A basename that *is* a task id ties it regardless.
+
+    Returns "" when the name is not a recognisable task id. Recognition is
+    deliberately anchored and exact: `t_<hex>`, optionally followed by a `-` or
+    `_` suffix. A name that merely contains a task id (`marvino-demo-t_93841552`)
+    or spells it with another separator (`t-b3824a2f-di`) is NOT recognised and
+    stays on the manual worktree-level review path.
+    """
+    match = TASK_WORKTREE_NAME_RE.match(str(name).strip().rstrip("/"))
+    return match.group(1).lower() if match else ""
 
 
 def human_bytes(count: int) -> str:
@@ -1078,6 +1104,7 @@ def evaluate_worktree(path: str, config: Config, state: HostState, self_path: st
         "remote_ref": "",
         "age_days": None,
         "tasks": [],
+        "inferred_task": "",
         "blockers": [],
         "notes": [],
         "inodes": None,
@@ -1282,6 +1309,32 @@ def evaluate_worktree(path: str, config: Config, state: HostState, self_path: st
             )
         if slugify(association.issue) in config.protected_task_slugs:
             block("protected-task", association.issue)
+
+    # A worktree *named* after a Kanban task belongs to that task whether or not
+    # any local metadata survives. Deleting artifacts/runs (or never writing
+    # them) must not silently drop the external-state gate for it, so the task
+    # id is inferred from the basename and required in task_cleanup_approved
+    # exactly like an artifact-derived association.
+    inferred = task_id_from_worktree_name(record["name"])
+    record["inferred_task"] = inferred
+    if inferred and slugify(inferred) not in {
+        slugify(association.issue) for association in associations.values()
+    }:
+        record["tasks"].append(
+            {"issue": inferred, "source": "worktree-name", "in_flight": False,
+             "detail": f"inferred from worktree name {record['name']}; "
+                       "no local run metadata for this task"}
+        )
+        if slugify(inferred) not in config.approved_task_slugs:
+            block(
+                "task-cleanup-not-approved",
+                f"{inferred}: external task state unknown (task id inferred from worktree "
+                f"name {record['name']}; no local run metadata for this task); add it to "
+                "task_cleanup_approved once the board shows it completed / approved for cleanup",
+            )
+        if slugify(inferred) in config.protected_task_slugs:
+            block("protected-task", inferred)
+
     if record["name"] and slugify(record["name"]) in config.protected_task_slugs:
         block("protected-task", record["name"])
 
@@ -1679,7 +1732,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="measure inode/byte usage for: none, eligible worktrees (default), all")
         sub.add_argument("--approve-task-cleanup", action="append",
                          help="task whose EXTERNAL state you confirmed completed/cleanup-approved "
-                              "(repeatable); task-associated worktrees are blocked without it")
+                              "(repeatable); worktrees associated with the task, or named after it "
+                              "(t_35c15c8a, t_35c15c8a-revert), are blocked without it")
         sub.add_argument("--strict-process-scan", action="store_true",
                          help="block every removal whenever any process needed the privileged probe")
         sub.add_argument("--no-privileged-process-probe", action="store_true",

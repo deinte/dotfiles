@@ -48,7 +48,7 @@ whole tool is built on.
 | `listener-attached` | a listening socket belongs to a process inside it |
 | `systemd-unit-associated` | any user unit — running or merely defined on disk — references the path |
 | `task-in-flight` | an `agent-task` run for it has no terminal `result.json` |
-| `task-cleanup-not-approved` | a task is associated but its **external** (board) state was never confirmed complete |
+| `task-cleanup-not-approved` | a task is associated — by local metadata, or by the worktree being named after it — but its **external** (board) state was never confirmed complete |
 | `task-metadata-unreadable` | `artifacts/*/run.json` or `runs/*.env` could not be parsed |
 | `worktree-lock-held` | the `agent-task` per-worktree flock is held |
 | `protected-task`, `protected-worktree` | explicitly protected by config or flag |
@@ -135,6 +135,24 @@ Therefore a worktree with **any** task association is blocked with
 worktree-gc collect --approve-task-cleanup SPOT-123 --approve --worktree <path>
 ```
 
+An association is established two ways, and either one is enough:
+
+1. **Local metadata** — `artifacts/*/run.json` or `runs/*.env` names the
+   worktree. This is how named issues like `SPOT-123` are associated.
+2. **The worktree name** — a basename that *is* a Kanban task id
+   (`t_[0-9a-f]+`), with or without a purpose suffix, belongs to that task
+   whether or not any metadata survives. `t_35c15c8a` infers `t_35c15c8a`;
+   `t_3626513e-revert` and `t_69b6784b-di` infer `t_3626513e` and
+   `t_69b6784b`. Deleting the artifacts of such a worktree does not make it
+   removable — the gate follows the name.
+
+Inference is anchored to the whole basename and the hex run is greedy, so
+approving one task never leaks to a similarly-named one: `t_3626513e` does not
+cover `t_3626513eab` (a different task) or `t_3626513` (another different
+task), and it covers `t_3626513e-revert` only because that name *is*
+`t_3626513e` plus a suffix. The inferred task is reported in the record's
+`inferred_task` field and listed under `tasks` with `source: worktree-name`.
+
 or, durably, `task_cleanup_approved` in the config file. Adding a task there is
 an explicit assertion that you looked at the board and it is completed or
 otherwise approved for cleanup. Approval never overrides anything else: an
@@ -202,7 +220,7 @@ picture.
   "critical_percent": 90,
   "privileged_process_probe": true,
   "strict_process_scan": false,
-  "task_cleanup_approved": ["SPOT-118", "SPOT-121"],
+  "task_cleanup_approved": ["SPOT-118", "SPOT-121", "t_35c15c8a"],
   "protected_tasks": ["SPOT-123"],
   "protected_worktrees": ["AE-V2-LAUNCH-READINESS"],
   "protected_ignored_globs": [".env", ".env.*", "*.sqlite", "*.sql", "auth.json"]
@@ -210,8 +228,9 @@ picture.
 ```
 
 `task_cleanup_approved` is the authoritative gate for task-associated
-worktrees. Each entry means *a human checked the board and this task is
-completed or approved for cleanup*. Anything not listed — active, in review,
+worktrees, including worktrees associated only by name (`t_35c15c8a`,
+`t_35c15c8a-revert`). Each entry means *a human checked the board and this task
+is completed or approved for cleanup*. Anything not listed — active, in review,
 blocked, or simply unknown — stays blocked. Keep the list short and prune it:
 it is a record of decisions already made, not a standing permission. A task may
 not appear in both `task_cleanup_approved` and `protected_tasks`; that is
@@ -335,11 +354,18 @@ in `protected_ignored_globs`; add the pattern before running the tool again.
 
 ## Known limitations
 
-- **The gate is only as good as the association.** A worktree whose
-  `artifacts/*/run.json` and `runs/*.env` were deleted has no task association
-  left, so `task-cleanup-not-approved` does not apply to it. It is still subject
-  to every other blocker (dirty, unmerged, in use, too recent, locked), but the
-  external-state gate cannot fire for a task it cannot see.
+- **Name inference covers `t_<hex>` worktrees only.** A worktree named after a
+  Kanban task is gated even with no local metadata, but a worktree whose name is
+  not a recognisable task id — a named-issue tree like `SPOT-123`, a topic tree
+  like `bold-studio-theme-redesign`, a name that merely *contains* a task id
+  (`marvino-demo-t_93841552`), or one spelled with another separator
+  (`t-b3824a2f-di`) — is only associated through `artifacts/*/run.json` and
+  `runs/*.env`. If that metadata is deleted, such a worktree has no association
+  left and `task-cleanup-not-approved` does not fire for it. It is still subject
+  to every other blocker (dirty, unmerged, in use, too recent, locked) and to
+  the manual, worktree-level review that `collect --approve` requires, but the
+  external-state gate cannot fire for a task it cannot see. Use
+  `protected_worktrees` for any such tree you want pinned regardless.
 - **`task_cleanup_approved` is a human assertion, not a live query.** This tool
   does not talk to the board, so an entry that was true last week is still
   trusted today. Prune the list rather than letting it accumulate.
