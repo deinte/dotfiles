@@ -69,20 +69,43 @@ commit on it stay in the owning repository under `~/agent-workstation/repos`.
 Re-evaluating "immediately before" a removal is not enough on its own: an
 `agent-task` run could still start between the final check and the delete.
 `collect --approve` therefore takes the **exact** per-worktree `flock` that
-`bin/agent-task` uses — `<root>/locks/<sha256 of the worktree path>.lock`, one
-file per spelling of the path, since agent-task hashes the path as it was
-spelled — *before* the final evaluation, and holds it continuously through the
-tree measurement and the plain `git worktree remove`. Only then is it released.
-An `agent-task` run that tries to start in that window fails to take the lock
-and refuses, exactly as it would against another run.
+`bin/agent-task` uses — `<root>/locks/<sha256 of the worktree path>.lock` —
+*before* the final evaluation, and holds it continuously through the plain
+`git worktree remove`. Only then is it released. An `agent-task` run that tries
+to start in that window fails to take the lock and refuses, exactly as it would
+against another run.
+
+**One canonical path, both sides.** The lock name is a hash of a path, so the
+two sides only contend if they hash the *same* spelling. `agent-task attach` and
+`agent-task start` both canonicalise to `git rev-parse --show-toplevel` resolved
+to its real path before hashing — `start` in particular canonicalises the path it
+reads out of `run.json`, which is data on disk and can hold `/./`, `//`, or `..`.
+`worktree-gc` derives the same canonical path itself rather than assuming
+whatever `prepare`/`attach` stored, and additionally probes the path as spelled
+and its plain absolute form so a legacy lock taken before canonicalisation, or
+by an older `agent-task`, is still seen. Extra probing can only add contention,
+never miss it.
 
 If the lock cannot be taken, the worktree is **skipped**; it is never forced,
 and the lock is never broken or removed. The lock files live in `<root>/locks`,
 outside the worktree, so holding them does not interfere with the removal
 itself.
 
-Eligibility is re-evaluated under that lock, so a worktree that becomes dirty or
-busy between the report and the delete is skipped.
+**Order inside the lock.** With the lock already held:
+
+1. the tree is measured (the expensive step, seconds on a large worktree);
+2. everything is then re-evaluated — host, process, listener, systemd, task,
+   git — including a **fresh `git fetch origin`**, with freshness *required*;
+3. the `statvfs` snapshot and the plain, non-`--force` `git worktree remove`
+   follow immediately.
+
+Measuring first keeps the slow step out of the recheck-to-removal window instead
+of stretching that window by its whole duration. The recheck refetches because
+reachability proved during planning can be invalidated afterwards by a
+force-push or a moved default branch; no blocker is filtered out of it, so a
+failed or missing fetch (`fetch-failed`, `remote-refs-not-fetched`) skips the
+worktree rather than falling back to cached refs. A worktree that becomes dirty,
+busy, unmerged, or task-blocked between the report and the delete is skipped.
 
 ### Process coverage fails closed
 
@@ -93,11 +116,23 @@ Two kinds of process cannot be inspected from an unprivileged `worktree-gc`:
 - every process owned by another uid (root daemons, containers, other users).
 
 For both, `/proc/<pid>/{cwd,root,exe,fd}` is unreadable, so "no process has a
-cwd or an open writer inside this worktree" is **unproven**. `argv` matching is
-a hint, not proof: a process can hold a worktree without naming it on its
-command line. Unproven is not the same as absent, so every such pid is recorded
-as *uncovered* and, while any remain, `process-coverage-incomplete` blocks every
-worktree. Inventory still reports each worktree's other findings, so you can see
+cwd or an open writer inside this worktree" is **unproven**. Coverage is
+per-reference, not per-process: failing to resolve a *single* listed fd, or the
+`exe` link, leaves that pid uncovered, because the reference we could not read
+is exactly the one that might point inside a candidate.
+
+A reference that is **gone** is not a failure. `ENOENT` means the process
+exited, the fd was closed between the listing and the `readlink`, or the
+reference never existed (a kernel thread has no `exe`) — nothing is left
+unproven, so that ordinary race does not become a permanent blocker. Every other
+error (`EACCES`/`EPERM` from a non-dumpable or foreign process, `EINVAL`,
+anything else) does leave the pid uncovered. The privileged probe below makes
+the same distinction and reports `unreadable` for that pid instead of `ok`.
+
+`argv` matching is a hint, not proof: a process can hold a worktree without
+naming it on its command line. Unproven is not the same as absent, so every pid
+whose references could not be established is recorded as *uncovered* and, while
+any remain, `process-coverage-incomplete` blocks every worktree. Inventory still reports each worktree's other findings, so you can see
 what would otherwise be eligible — but nothing is removable.
 
 There is exactly one way to clear an uncovered pid: prove what it references.
@@ -106,14 +141,24 @@ There is exactly one way to clear an uncovered pid: prove what it references.
 and read-mode `open` under `/proc` and prints what it found. It is
 non-interactive: `sudo -n` never prompts, so on a host without passwordless
 sudo the probe simply fails and everything stays blocked. Its output is only
-trusted when it ends with the `PROBE-OK` sentinel and reports a definite status
-(`ok` or `gone`) per pid; anything else clears nothing. References it finds are
-merged into the normal evaluation, so a probed process holding a candidate shows
-up as an ordinary `in-use-by-process` blocker.
+trusted when it ends with the `PROBE-OK` sentinel, every line parses, and it
+reports a definite status (`ok` or `gone`) per pid; partial output, a pid it
+listed references for but never gave a final status to, or any line that does
+not parse clears nothing. References it finds are merged into the normal
+evaluation, so a probed process holding a candidate shows up as an ordinary
+`in-use-by-process` blocker.
 
-Grant the probe by allowing exactly that read-only command in `sudoers`, or
-leave it unavailable and accept that removal stays blocked. Turn the attempt off
-with `privileged_process_probe: false` or `--no-privileged-process-probe`.
+**Do not grant this with a `sudoers` rule for `python3 -c`.** A rule that lets a
+command run arbitrary inline source under `sudo` is a grant of root, not of a
+probe: the probe body is passed on the command line, so anything able to invoke
+that rule can substitute any other body. The safe enablement path is a *fixed,
+root-owned, non-writable helper script* on disk, with a `sudoers` rule naming
+that exact path and nothing else — which is future work; the tool does not ship
+one today. Until it exists, the honest position is that the probe is unavailable
+on a normal host: process coverage stays incomplete and `collect --approve`
+deletes nothing. That is the intended outcome, not a malfunction. Turn the
+attempt off entirely with `privileged_process_probe: false` or
+`--no-privileged-process-probe`.
 
 `strict_process_scan` (or `--strict-process-scan`) is the paranoid setting: it
 blocks even when the probe *did* prove absence, on the grounds that some pid was
@@ -369,20 +414,33 @@ in `protected_ignored_globs`; add the pattern before running the tool again.
 - **`task_cleanup_approved` is a human assertion, not a live query.** This tool
   does not talk to the board, so an entry that was true last week is still
   trusted today. Prune the list rather than letting it accumulate.
-- **Process coverage depends on the privileged probe.** Without passwordless
-  `sudo` for the read-only probe, coverage on a normal Linux host is never
-  complete and `collect --approve` will remove nothing. That is the intended
-  fail-closed outcome, not a malfunction.
-- **The probe is a point-in-time proof.** It runs during the evaluation that the
-  removal lock covers, so an `agent-task` run cannot slip in — but an unrelated
-  process could still open the worktree in the same window. The lock does not,
-  and cannot, exclude arbitrary processes.
+- **Process coverage depends on a privileged probe that has no safe enabler
+  yet.** Without one, coverage on a normal Linux host is never complete and
+  `collect --approve` will remove nothing. Enabling it via a broad `sudoers`
+  rule for `python3 -c` is not an option (that is a root grant); a fixed
+  root-owned helper with a rule naming its exact path is the safe route and is
+  not built yet. No privilege therefore means deletion stays blocked.
+- **Unrelated processes are point-in-time checked, and cannot be excluded.**
+  The `agent-task` flock covers the managed writers — no `agent-task` run can
+  start between the final recheck and the removal. It says nothing about any
+  other process on the host: an editor, a shell, a build, a container can open
+  or `cd` into the worktree microseconds after the recheck reads `/proc`, and
+  there is no kernel mechanism this tool could use to prevent that. The process,
+  listener, and unit checks are a snapshot taken as late as possible (which is
+  why the tree measurement is moved ahead of them), not an exclusion. `git
+  worktree remove` without `--force` is the backstop: it refuses when the tree
+  is dirty, which is what a writer that arrived in that window would have made
+  it.
 - **`argv` matching stays best-effort** for any pid the probe could not cover; it
   can only ever add blockers, never clear them.
 
 ## Tests
 
 ```bash
-tests/worktree-gc.bash        # safety predicates and command behaviour
-tests/linux-devstation.bash   # install/link/backup flow, including worktree-gc
+tests/worktree-gc.bash             # safety predicates and command behaviour,
+                                   # including the agent-task lock-path parity
+                                   # regression (a lexical run.json path and a
+                                   # GC candidate must contend on one flock)
+tests/linux-devstation.bash        # install/link/backup flow, including worktree-gc
+tests/integration-agent-task.bash  # the agent-task side of that contract
 ```

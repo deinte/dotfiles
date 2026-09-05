@@ -14,9 +14,11 @@ removed. In particular:
     task_cleanup_approved, and a worktree *named* after a Kanban task
     (t_35c15c8a, t_3626513e-revert) needs it even when that metadata is
     missing entirely;
-  * `collect --approve` holds the agent-task per-worktree flock from before the
-    final evaluation until after `git worktree remove` returns, so no run can
-    start in the check-to-delete window.
+  * `collect --approve` holds the agent-task per-worktree flock - keyed on the
+    same canonical worktree path bin/agent-task hashes - from before the final
+    evaluation until after `git worktree remove` returns, so no agent-task run
+    can start in the check-to-delete window. That final evaluation re-fetches
+    origin and re-proves reachability rather than trusting the plan's.
 
 Commands
   inventory     read-only eligibility/blocker report with estimated reclaim
@@ -29,6 +31,7 @@ See docs/worktree-retention.md for the approval gate and rollout policy.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -299,11 +302,28 @@ class ProcessScan:
         return not self.uncovered_pids
 
 
-def _read_link(path: str):
+def _read_link(path: str) -> tuple:
+    """Read one /proc symlink. Returns (target, failure).
+
+    ENOENT is a *disappearance*, not a failure: the process exited, the fd was
+    closed between the listing and the readlink, or the reference genuinely does
+    not exist (a kernel thread has no `exe`). A reference that is gone cannot be
+    holding a worktree open, so nothing is left unproven and the pid stays
+    covered - turning that ordinary race into a permanent blocker would be
+    wrong.
+
+    Every other error - EACCES/EPERM for a non-dumpable or foreign process,
+    EINVAL, anything else - IS a failure to inspect. `failure` is then a
+    non-empty reason and the caller must leave the pid uncovered.
+    """
     try:
-        return os.readlink(path)
-    except (OSError, ValueError):
-        return None
+        return os.readlink(path), ""
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return None, ""
+        return None, f"{path}: {exc}"
+    except ValueError as exc:  # e.g. an embedded NUL in the path
+        return None, f"{path}: {exc}"
 
 
 def _read_cmdline(pid_dir: str) -> str:
@@ -352,53 +372,80 @@ def scan_processes(proc_root: str = "/proc") -> ProcessScan:
         if not entry.isdigit():
             continue
         pid_dir = os.path.join(proc_root, entry)
+        # Every reason this pid could not be fully inspected. Partial reads
+        # count: one unresolvable fd is enough to leave it uncovered, because
+        # that fd could point inside a candidate worktree.
+        failures = []
         try:
             pid_uid = os.stat(pid_dir).st_uid
-        except OSError:
+        except FileNotFoundError:
             continue  # process exited between listdir and stat
+        except OSError as exc:
+            pid_uid = -2  # unknown owner; classified as foreign below
+            failures.append(f"{pid_dir}: {exc}")
         references = []
-        unreadable = False
         for kind in ("cwd", "root", "exe"):
-            target = _read_link(os.path.join(pid_dir, kind))
-            if target is None:
-                if os.path.exists(os.path.join(pid_dir, kind)) or kind != "exe":
-                    unreadable = True
+            target, failure = _read_link(os.path.join(pid_dir, kind))
+            if failure:
+                failures.append(failure)
                 continue
+            if target is None:
+                continue  # gone: an exited process, or a thread with no exe
             references.append((kind, target, False))
         fd_dir = os.path.join(pid_dir, "fd")
         try:
             fds = os.listdir(fd_dir)
         except FileNotFoundError:
+            fds = []  # the process exited; it holds nothing open any more
+        except OSError as exc:
             fds = []
-        except OSError:
-            fds = []
-            unreadable = True
+            failures.append(f"{fd_dir}: {exc}")
         for fd in fds:
-            target = _read_link(os.path.join(fd_dir, fd))
+            target, failure = _read_link(os.path.join(fd_dir, fd))
+            if failure:
+                failures.append(failure)
+                continue
             if target is None or not target.startswith("/"):
                 continue
             references.append((f"fd{fd}", target, _fd_is_writable(pid_dir, fd)))
-        if unreadable:
+        if failures:
+            detail = failures[0]
             if pid_uid == own_uid:
                 cmdline = _read_cmdline(pid_dir)
                 scan.restricted[entry] = cmdline
-                scan.uncovered_pids[entry] = f"own pid, /proc links unreadable; argv: {cmdline[:60]}"
+                scan.uncovered_pids[entry] = (
+                    f"own pid, /proc reference uninspectable ({detail}); argv: {cmdline[:60]}"
+                )
             else:
                 scan.unreadable_foreign_pids.append(entry)
-                scan.uncovered_pids[entry] = "foreign-uid pid, /proc links unreadable"
+                scan.uncovered_pids[entry] = (
+                    f"foreign-uid pid, /proc reference uninspectable ({detail})"
+                )
         if references:
             scan.holders[entry] = references
     return scan
 
 
-# A read-only inspector for pids this process cannot read itself. It only ever
-# calls readlink/listdir/open under /proc and prints what it found; it never
-# writes, signals, or otherwise touches anything.
+# A read-only inspector for pids this process cannot read itself. argv[1] is the
+# proc root (always "/proc" in production; a fixture root in the tests) and the
+# rest are pids. It only ever calls readlink/listdir/read-mode open under that
+# root and prints what it found; it never writes, signals, or otherwise touches
+# anything.
+#
+# Its per-pid status distinguishes the same two cases the unprivileged scan
+# does: a reference that is *gone* (ENOENT - the process exited, the fd was
+# closed under us, a kernel thread has no exe) leaves the pid `ok`, while any
+# other failure on a required cwd/root/exe/fd reference makes it `unreadable`
+# so the caller keeps that pid uncovered.
 PRIVILEGED_PROBE_SOURCE = r"""
-import os, sys
+import errno, os, sys
 
-for pid in sys.argv[1:]:
-    base = "/proc/" + pid
+def vanished(exc):
+    return getattr(exc, "errno", None) == errno.ENOENT
+
+root = sys.argv[1]
+for pid in sys.argv[2:]:
+    base = root + "/" + pid
     if not os.path.isdir(base):
         print("PID\t%s\tgone" % pid)
         continue
@@ -406,22 +453,23 @@ for pid in sys.argv[1:]:
     for kind in ("cwd", "root", "exe"):
         try:
             target = os.readlink(base + "/" + kind)
-        except OSError:
-            if kind != "exe":
+        except OSError as exc:
+            if not vanished(exc):
                 status = "unreadable"
             continue
         print("REF\t%s\t%s\t0\t%s" % (pid, kind, target))
     try:
         fds = os.listdir(base + "/fd")
-    except FileNotFoundError:
+    except OSError as exc:
         fds = []
-    except OSError:
-        fds = []
-        status = "unreadable"
+        if not vanished(exc):
+            status = "unreadable"
     for fd in fds:
         try:
             target = os.readlink(base + "/fd/" + fd)
-        except OSError:
+        except OSError as exc:
+            if not vanished(exc):
+                status = "unreadable"
             continue
         if not target.startswith("/"):
             continue
@@ -440,11 +488,13 @@ print("PROBE-OK")
 """
 
 PROBE_SENTINEL = "PROBE-OK"
+PROBE_PROC_ROOT = "/proc"
 
 
 def default_privileged_probe(pids) -> list:
     """Non-interactive (`sudo -n`) read-only probe. Never prompts for a password."""
-    return ["sudo", "-n", "--", sys.executable, "-c", PRIVILEGED_PROBE_SOURCE, *pids]
+    return ["sudo", "-n", "--", sys.executable, "-c", PRIVILEGED_PROBE_SOURCE,
+            PROBE_PROC_ROOT, *pids]
 
 
 def resolve_process_coverage(scan: ProcessScan, enabled: bool = True, probe=None) -> ProcessScan:
@@ -452,8 +502,9 @@ def resolve_process_coverage(scan: ProcessScan, enabled: bool = True, probe=None
 
     A pid is only cleared when the probe reported a definite result for it
     (`ok`, with its references merged in, or `gone`). Partial or unauthenticated
-    probe output clears nothing: the sentinel must be present, or the whole run
-    is discarded.
+    probe output clears nothing: the sentinel must be present and every line
+    must parse, or the whole run is discarded, and a pid the probe listed
+    references for but never gave a final status to stays uncovered.
     """
     if scan.error or not scan.uncovered_pids:
         scan.probe = "not needed"
@@ -471,12 +522,20 @@ def resolve_process_coverage(scan: ProcessScan, enabled: bool = True, probe=None
 
     references: dict = {}
     statuses: dict = {}
+    # Strict parsing: a line we do not understand means the output is not the
+    # probe's, or is mangled (a path containing a newline would do it), so the
+    # whole run is discarded rather than half-believed.
     for line in out.splitlines():
-        parts = line.split("\t")
-        if parts[0] == "REF" and len(parts) == 5:
+        if line == PROBE_SENTINEL:
+            continue
+        parts = line.split("\t", 4)  # maxsplit keeps tabs inside a path intact
+        if parts[0] == "REF" and len(parts) == 5 and parts[3] in {"0", "1"}:
             references.setdefault(parts[1], []).append((parts[2], parts[4], parts[3] == "1"))
         elif parts[0] == "PID" and len(parts) == 3:
             statuses[parts[1]] = parts[2]
+        else:
+            scan.probe = f"privileged probe output not understood ({line[:60]!r}); nothing cleared"
+            return scan
 
     cleared = 0
     for pid in pids:
@@ -747,14 +806,37 @@ def task_is_in_flight(artifacts_dir: Path) -> tuple[bool, str]:
     return False, f"{latest.name} state={state}"
 
 
+def canonical_worktree_path(path: str) -> str:
+    """The one spelling bin/agent-task hashes: the git top-level, fully resolved.
+
+    `agent-task attach` and `agent-task start` both canonicalise to
+    `git rev-parse --show-toplevel` and then to the real path before hashing, so
+    this is the lock identity both sides must agree on. Parity is explicit here
+    rather than inherited from whatever prepare/attach happened to store.
+
+    Falls back to the resolved input when git cannot answer (the path is gone,
+    or is not a worktree) - the fallback only ever picks a different file name,
+    never skips locking.
+    """
+    ok, out, _ = git(["-C", path, "rev-parse", "--show-toplevel"])
+    candidate = out.strip() if ok and out.strip() else path
+    try:
+        return str(Path(candidate).resolve())
+    except OSError:
+        return str(Path(candidate).absolute())
+
+
 def lock_files_for(root: Path, worktree_path: str) -> list:
     """Every lock file agent-task could pick for this worktree.
 
-    bin/agent-task keys the flock on sha256 of the worktree path *as spelled on
-    its command line*, so all spellings that resolve to this worktree have to be
-    covered or a differently-spelled writer would slip past.
+    The canonical path (git top-level, resolved) is what current `agent-task`
+    hashes. The path as spelled and its plain absolute form are kept as well:
+    a run started by an older agent-task, or one already holding a legacy lock
+    taken before canonicalisation, must still be seen. Probing the extra names
+    is conservative - it can only add contention, never miss it.
     """
-    candidates = {worktree_path, str(Path(worktree_path).absolute())}
+    candidates = {worktree_path, str(Path(worktree_path).absolute()),
+                  canonical_worktree_path(worktree_path)}
     try:
         candidates.add(str(Path(worktree_path).resolve()))
     except OSError:
@@ -1530,23 +1612,27 @@ def command_collect(args) -> int:
             print(f"SKIP {path}: could not take the worktree lock ({lock_error})")
             continue
         try:
-            # Re-evaluate under the lock so nothing raced the report.
+            # Expensive work first, still under the lock. Walking a large tree
+            # takes seconds; doing it before the final recheck keeps it out of
+            # the recheck-to-removal window instead of stretching that window by
+            # its whole duration. This measurement is an ESTIMATE of what the
+            # removal should free - the observed figures below come from statvfs
+            # snapshots taken immediately before and after `git worktree remove`.
+            estimated_inodes, estimated_bytes, _ = measure_tree(path)
+            # Final recheck, immediately before the snapshot and the removal.
+            # origin is fetched again and freshness is required: the plan's
+            # reachability proof can be invalidated between planning and now by
+            # a force-push or a moved default branch, so it is re-established
+            # rather than reused. No blocker is filtered out here.
             fresh = build_report(
-                config, [path], "none", fetch=False, fetch_required=False,
+                config, [path], "none", fetch=True, fetch_required=True,
                 owned_locks=guard.lock_files,
             )
             record = fresh["worktrees"][0]
-            recheck_blockers = [
-                blocker for blocker in record["blockers"] if blocker["code"] != "remote-refs-not-fetched"
-            ]
-            if recheck_blockers:
-                failed.append((path, "recheck blocked: " + recheck_blockers[0]["code"]))
-                print(f"SKIP {path}: recheck blocked ({recheck_blockers[0]['code']})")
+            if record["blockers"]:
+                failed.append((path, "recheck blocked: " + record["blockers"][0]["code"]))
+                print(f"SKIP {path}: recheck blocked ({record['blockers'][0]['code']})")
                 continue
-            # Pre-removal tree measurement is an ESTIMATE of what removal should
-            # free. The observed figures below come from statvfs snapshots taken
-            # immediately before and after `git worktree remove`.
-            estimated_inodes, estimated_bytes, _ = measure_tree(path)
             anchor = snapshot_anchor(path)
             before, before_error = fs_free_snapshot(anchor)
             ok, error = remove_worktree(record["main_repo"], path)
