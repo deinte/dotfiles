@@ -58,7 +58,11 @@ worktree-gc inode-check        # 0 ok, 1 warn, 2 critical, 3 unknown
 ```
 
 Every safety predicate fails closed, local branches and commits are preserved,
-and `--approve` must never be scheduled. See
+and `--approve` must never be scheduled. Three gates in particular are strict:
+a worktree stays blocked while any process's `/proc` references are unreadable,
+a task-associated worktree needs its external board state recorded in
+`task_cleanup_approved`, and `collect --approve` holds the `agent-task`
+per-worktree flock from the final check until after `git worktree remove`. See
 [Worktree retention and inode pressure](worktree-retention.md) for the full
 blocker list, configuration, monitoring setup, and rollout policy.
 

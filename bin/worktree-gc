@@ -4,7 +4,17 @@
 Default behaviour is a read-only, dry-run inventory. Nothing is ever deleted
 unless `collect --approve` is passed explicitly. Every safety predicate fails
 closed: when a fact cannot be established the worktree is blocked, never
-removed.
+removed. In particular:
+
+  * a process whose /proc references cannot be read leaves coverage incomplete,
+    which blocks every removal until a read-only privileged probe proves what it
+    actually holds;
+  * local agent-task metadata never authorises removal on its own - a
+    task-associated worktree needs its external (board) state recorded in
+    task_cleanup_approved;
+  * `collect --approve` holds the agent-task per-worktree flock from before the
+    final evaluation until after `git worktree remove` returns, so no run can
+    start in the check-to-delete window.
 
 Commands
   inventory     read-only eligibility/blocker report with estimated reclaim
@@ -52,11 +62,21 @@ DEFAULTS = {
     # Ignored (git-ignored) paths that still make removal unsafe. Build output
     # such as vendor/ or node_modules/ is exactly what we want to reclaim, but
     # local credentials and databases are not reproducible.
-    # Some of this user's own processes (systemd --user, sshd session leaders,
-    # php-fpm workers) are non-dumpable, so /proc/<pid>/{cwd,root,exe,fd} cannot
-    # be read even though we own them. They are matched on argv instead. Set
-    # strict_process_scan to block every removal while any such process exists.
+    # Some processes cannot be inspected at all: this user's non-dumpable ones
+    # (systemd --user, sshd session leaders, php-fpm workers) and every
+    # foreign-uid process. For those, /proc/<pid>/{cwd,root,exe,fd} is
+    # unreadable, so "nothing is using this worktree" is unproven. A read-only
+    # privileged probe (sudo -n, never interactive) is attempted to close that
+    # gap; anything it cannot cover blocks removal.
+    "privileged_process_probe": True,
+    # Paranoid: block even when the probe proved absence, as long as any
+    # process needed one.
     "strict_process_scan": False,
+    # Task identifiers whose EXTERNAL (Kanban/board) state a human has checked
+    # and confirmed completed / approved for cleanup. Local agent-task run
+    # metadata is not authoritative; an associated worktree stays blocked until
+    # its task appears here.
+    "task_cleanup_approved": [],
     "protected_ignored_globs": [
         ".env",
         ".env.*",
@@ -133,6 +153,8 @@ class Config:
     protected_tasks: list = field(default_factory=list)
     protected_ignored_globs: list = field(default_factory=lambda: list(DEFAULTS["protected_ignored_globs"]))
     strict_process_scan: bool = bool(DEFAULTS["strict_process_scan"])
+    privileged_process_probe: bool = bool(DEFAULTS["privileged_process_probe"])
+    task_cleanup_approved: list = field(default_factory=list)
     config_path: str = ""
     config_errors: list = field(default_factory=list)
 
@@ -143,6 +165,11 @@ class Config:
     @property
     def protected_task_slugs(self) -> set:
         return {slugify(task) for task in self.protected_tasks if slugify(task)}
+
+    @property
+    def approved_task_slugs(self) -> set:
+        """Tasks a human confirmed complete on the external board."""
+        return {slugify(task) for task in self.task_cleanup_approved if slugify(task)}
 
     @property
     def protected_worktree_paths(self) -> set:
@@ -196,6 +223,10 @@ def build_config(args) -> Config:
         data.get("protected_ignored_globs", DEFAULTS["protected_ignored_globs"])
     )
     config.strict_process_scan = bool(data.get("strict_process_scan", DEFAULTS["strict_process_scan"]))
+    config.privileged_process_probe = bool(
+        data.get("privileged_process_probe", DEFAULTS["privileged_process_probe"])
+    )
+    config.task_cleanup_approved = list(data.get("task_cleanup_approved", []))
 
     if getattr(args, "min_age_days", None) is not None:
         config.min_age_days = float(args.min_age_days)
@@ -206,11 +237,17 @@ def build_config(args) -> Config:
     config.protected_worktrees += list(getattr(args, "protect_worktree", None) or [])
     config.protected_tasks += list(getattr(args, "protect_task", None) or [])
     config.protected_ignored_globs += list(getattr(args, "protect_ignored_glob", None) or [])
+    config.task_cleanup_approved += list(getattr(args, "approve_task_cleanup", None) or [])
     if getattr(args, "strict_process_scan", False):
         config.strict_process_scan = True
+    if getattr(args, "no_privileged_process_probe", False):
+        config.privileged_process_probe = False
 
     if config.min_age_days < 0:
         die("--min-age-days must not be negative")
+    conflicting = sorted(config.approved_task_slugs & config.protected_task_slugs)
+    if conflicting:
+        die(f"task(s) both protected and cleanup-approved: {', '.join(conflicting)}")
     return config
 
 
@@ -224,7 +261,16 @@ class ProcessScan:
     holders: dict = field(default_factory=dict)  # pid -> list of (kind, path, writable)
     restricted: dict = field(default_factory=dict)  # own pid -> cmdline (links unreadable)
     unreadable_foreign_pids: list = field(default_factory=list)
+    # pid -> why its filesystem references could not be established. While this
+    # is non-empty, "no process references this worktree" is unproven and every
+    # removal is blocked.
+    uncovered_pids: dict = field(default_factory=dict)
+    probe: str = ""  # what the privileged coverage probe did, for the report
     error: str = ""
+
+    @property
+    def coverage_complete(self) -> bool:
+        return not self.uncovered_pids
 
 
 def _read_link(path: str):
@@ -258,10 +304,12 @@ def _fd_is_writable(pid_dir: str, fd: str) -> bool:
 def scan_processes(proc_root: str = "/proc") -> ProcessScan:
     """Record every process reference into the filesystem.
 
-    Processes owned by this user that cannot be inspected are a hard, global
-    fail-closed condition. Foreign-uid processes (root daemons) are reported but
-    do not block, because their /proc entries are never readable here and
-    treating them as unknown would block every removal forever.
+    Any process whose /proc links cannot be read - this user's non-dumpable
+    ones and every foreign-uid one alike - is recorded in `uncovered_pids`.
+    Uncovered pids are a fail-closed condition: absence of a cwd or open writer
+    inside a candidate is unproven while any of them remain, so removal is
+    blocked. `resolve_process_coverage` is the only way to clear them, and it
+    does so only by actually reading their references.
     """
     scan = ProcessScan()
     try:
@@ -306,11 +354,119 @@ def scan_processes(proc_root: str = "/proc") -> ProcessScan:
             references.append((f"fd{fd}", target, _fd_is_writable(pid_dir, fd)))
         if unreadable:
             if pid_uid == own_uid:
-                scan.restricted[entry] = _read_cmdline(pid_dir)
+                cmdline = _read_cmdline(pid_dir)
+                scan.restricted[entry] = cmdline
+                scan.uncovered_pids[entry] = f"own pid, /proc links unreadable; argv: {cmdline[:60]}"
             else:
                 scan.unreadable_foreign_pids.append(entry)
+                scan.uncovered_pids[entry] = "foreign-uid pid, /proc links unreadable"
         if references:
             scan.holders[entry] = references
+    return scan
+
+
+# A read-only inspector for pids this process cannot read itself. It only ever
+# calls readlink/listdir/open under /proc and prints what it found; it never
+# writes, signals, or otherwise touches anything.
+PRIVILEGED_PROBE_SOURCE = r"""
+import os, sys
+
+for pid in sys.argv[1:]:
+    base = "/proc/" + pid
+    if not os.path.isdir(base):
+        print("PID\t%s\tgone" % pid)
+        continue
+    status = "ok"
+    for kind in ("cwd", "root", "exe"):
+        try:
+            target = os.readlink(base + "/" + kind)
+        except OSError:
+            if kind != "exe":
+                status = "unreadable"
+            continue
+        print("REF\t%s\t%s\t0\t%s" % (pid, kind, target))
+    try:
+        fds = os.listdir(base + "/fd")
+    except FileNotFoundError:
+        fds = []
+    except OSError:
+        fds = []
+        status = "unreadable"
+    for fd in fds:
+        try:
+            target = os.readlink(base + "/fd/" + fd)
+        except OSError:
+            continue
+        if not target.startswith("/"):
+            continue
+        writable = "1"
+        try:
+            with open(base + "/fdinfo/" + fd) as handle:
+                for line in handle:
+                    if line.startswith("flags:"):
+                        flags = int(line.split()[1], 8)
+                        writable = "1" if flags & (os.O_WRONLY | os.O_RDWR) else "0"
+        except (OSError, ValueError, IndexError):
+            writable = "1"
+        print("REF\t%s\tfd%s\t%s\t%s" % (pid, fd, writable, target))
+    print("PID\t%s\t%s" % (pid, status))
+print("PROBE-OK")
+"""
+
+PROBE_SENTINEL = "PROBE-OK"
+
+
+def default_privileged_probe(pids) -> list:
+    """Non-interactive (`sudo -n`) read-only probe. Never prompts for a password."""
+    return ["sudo", "-n", "--", sys.executable, "-c", PRIVILEGED_PROBE_SOURCE, *pids]
+
+
+def resolve_process_coverage(scan: ProcessScan, enabled: bool = True, probe=None) -> ProcessScan:
+    """Try to prove what the uncovered pids reference; leave them uncovered if not.
+
+    A pid is only cleared when the probe reported a definite result for it
+    (`ok`, with its references merged in, or `gone`). Partial or unauthenticated
+    probe output clears nothing: the sentinel must be present, or the whole run
+    is discarded.
+    """
+    if scan.error or not scan.uncovered_pids:
+        scan.probe = "not needed"
+        return scan
+    if not enabled:
+        scan.probe = f"disabled; {len(scan.uncovered_pids)} pid(s) uninspectable"
+        return scan
+
+    pids = sorted(scan.uncovered_pids, key=int)
+    ok, out, err = run_command((probe or default_privileged_probe)(pids), timeout=120)
+    if not ok or PROBE_SENTINEL not in out.splitlines():
+        detail = (err or "").strip().splitlines()
+        scan.probe = "privileged probe unavailable: " + (detail[-1] if detail else "no usable output")
+        return scan
+
+    references: dict = {}
+    statuses: dict = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if parts[0] == "REF" and len(parts) == 5:
+            references.setdefault(parts[1], []).append((parts[2], parts[4], parts[3] == "1"))
+        elif parts[0] == "PID" and len(parts) == 3:
+            statuses[parts[1]] = parts[2]
+
+    cleared = 0
+    for pid in pids:
+        if statuses.get(pid) not in {"ok", "gone"}:
+            continue
+        found = references.get(pid, [])
+        if found:
+            scan.holders.setdefault(pid, []).extend(found)
+        # Authoritative references replace the argv guess for this pid.
+        scan.restricted.pop(pid, None)
+        scan.uncovered_pids.pop(pid, None)
+        cleared += 1
+    scan.probe = (
+        f"privileged probe covered {cleared}/{len(pids)} pid(s); "
+        f"{len(scan.uncovered_pids)} still uninspectable"
+    )
     return scan
 
 
@@ -565,16 +721,33 @@ def task_is_in_flight(artifacts_dir: Path) -> tuple[bool, str]:
     return False, f"{latest.name} state={state}"
 
 
-def lock_is_held(root: Path, worktree_path: str) -> tuple[bool, str]:
-    """Probe the agent-task per-worktree flock without disturbing a live holder."""
+def lock_files_for(root: Path, worktree_path: str) -> list:
+    """Every lock file agent-task could pick for this worktree.
+
+    bin/agent-task keys the flock on sha256 of the worktree path *as spelled on
+    its command line*, so all spellings that resolve to this worktree have to be
+    covered or a differently-spelled writer would slip past.
+    """
     candidates = {worktree_path, str(Path(worktree_path).absolute())}
     try:
         candidates.add(str(Path(worktree_path).resolve()))
     except OSError:
         pass
-    for candidate in candidates:
-        digest = hashlib.sha256(candidate.encode()).hexdigest()
-        lock_file = root / "locks" / f"{digest}.lock"
+    digests = {hashlib.sha256(candidate.encode()).hexdigest() for candidate in candidates}
+    return sorted(root / "locks" / f"{digest}.lock" for digest in digests)
+
+
+def lock_is_held(root: Path, worktree_path: str, owned=()) -> tuple[bool, str]:
+    """Probe the agent-task per-worktree flock without disturbing a live holder.
+
+    `owned` lists lock files this process already holds (see WorktreeLockGuard).
+    flock conflicts between distinct open file descriptions even inside one
+    process, so without this our own guard would read as a foreign writer.
+    """
+    owned = {str(path) for path in owned}
+    for lock_file in lock_files_for(root, worktree_path):
+        if str(lock_file) in owned:
+            continue
         if not lock_file.exists():
             continue
         try:
@@ -589,6 +762,68 @@ def lock_is_held(root: Path, worktree_path: str) -> tuple[bool, str]:
         finally:
             handle.close()
     return False, ""
+
+
+class WorktreeLockGuard:
+    """Hold the agent-task per-worktree flock across evaluation AND removal.
+
+    This closes the time-of-check/time-of-use window: without it an agent-task
+    run could start between the final re-evaluation and `git worktree remove`.
+    The lock files live in <root>/locks, outside the worktree, so holding them
+    never interferes with the removal itself.
+    """
+
+    def __init__(self, root: Path, worktree_path: str):
+        self.root = root
+        self.worktree_path = worktree_path
+        self.paths = lock_files_for(root, worktree_path)
+        self._handles: list = []
+
+    @property
+    def lock_files(self) -> set:
+        """Lock files currently held, as strings, for lock_is_held(owned=...)."""
+        return {str(path) for path, _ in self._handles}
+
+    @property
+    def held(self) -> bool:
+        return len(self._handles) == len(self.paths) and bool(self._handles)
+
+    def acquire(self) -> tuple[bool, str]:
+        try:
+            (self.root / "locks").mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return False, f"cannot create locks directory: {exc}"
+        for path in self.paths:
+            try:
+                # Same open mode as bin/agent-task: create if absent, never truncate.
+                handle = open(path, "a")
+            except OSError as exc:
+                self.release()
+                return False, f"cannot open {path.name}: {exc}"
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                handle.close()
+                self.release()
+                return False, f"{path.name} is held by another writer: {exc}"
+            self._handles.append((path, handle))
+        return True, ""
+
+    def release(self) -> None:
+        while self._handles:
+            _, handle = self._handles.pop()
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            handle.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.release()
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -817,7 +1052,9 @@ class HostState:
 def collect_host_state(config: Config, fetch: bool, repos=None) -> HostState:
     associations, problems = read_task_associations(config.root)
     state = HostState(
-        processes=scan_processes(),
+        processes=resolve_process_coverage(
+            scan_processes(), enabled=config.privileged_process_probe
+        ),
         listeners=scan_listeners(),
         units=scan_units(),
         associations=associations,
@@ -829,7 +1066,8 @@ def collect_host_state(config: Config, fetch: bool, repos=None) -> HostState:
     return state
 
 
-def evaluate_worktree(path: str, config: Config, state: HostState, self_path: str, fetch_required: bool) -> dict:
+def evaluate_worktree(path: str, config: Config, state: HostState, self_path: str, fetch_required: bool,
+                      owned_locks=()) -> dict:
     """Return a record with every blocker found. Empty blockers means eligible."""
     record = {
         "path": path,
@@ -976,11 +1214,21 @@ def evaluate_worktree(path: str, config: Config, state: HostState, self_path: st
     # --- live usage -------------------------------------------------------
     if state.processes.error:
         block("process-scan-failed", state.processes.error)
-    if config.strict_process_scan and state.processes.restricted:
+    # Fail closed: while any pid's references are unknown, the absence of a cwd
+    # or an open writer inside this candidate is unproven, so it may not be
+    # removed. The inventory still reports every other finding for it.
+    if state.processes.uncovered_pids:
+        # Host-wide condition: the offending pids are listed once, in the report
+        # header, rather than repeated under every worktree.
         block(
-            "process-scan-incomplete",
-            f"strict mode: {len(state.processes.restricted)} own pids expose argv only",
+            "process-coverage-incomplete",
+            f"{len(state.processes.uncovered_pids)} pid(s) uninspectable, so cwd/open-writer "
+            f"absence is unproven ({state.processes.probe or 'no privileged probe'})",
         )
+    # Paranoid mode: block even when the probe proved absence, on the grounds
+    # that some pid was not directly readable by this user at all.
+    if config.strict_process_scan and state.processes.probe not in ("", "not needed"):
+        block("process-scan-incomplete", f"strict mode: {state.processes.probe}")
     argv_hits = restricted_processes_naming(state.processes, paths)
     if argv_hits:
         block("in-use-by-process", "; ".join(argv_hits[:3]))
@@ -1021,12 +1269,23 @@ def evaluate_worktree(path: str, config: Config, state: HostState, self_path: st
         )
         if association.in_flight:
             block("task-in-flight", f"{association.issue}: {association.detail}")
+        # Local run metadata only describes the last local execution. It says
+        # nothing about the task's real lifecycle on the board, so a terminal or
+        # missing local run never authorises removal on its own: the external
+        # state is unknown until a human records it here.
+        if slugify(association.issue) not in config.approved_task_slugs:
+            block(
+                "task-cleanup-not-approved",
+                f"{association.issue}: external task state unknown "
+                f"(local run: {association.detail}); add it to task_cleanup_approved "
+                "once the board shows it completed / approved for cleanup",
+            )
         if slugify(association.issue) in config.protected_task_slugs:
             block("protected-task", association.issue)
     if record["name"] and slugify(record["name"]) in config.protected_task_slugs:
         block("protected-task", record["name"])
 
-    held, lock_detail = lock_is_held(config.root, path)
+    held, lock_detail = lock_is_held(config.root, path, owned=owned_locks)
     if held:
         block("worktree-lock-held", lock_detail)
 
@@ -1048,7 +1307,8 @@ def discover_worktrees(config: Config, only=None) -> list:
     return sorted(entries)
 
 
-def build_report(config: Config, only, measure: str, fetch: bool, fetch_required: bool) -> dict:
+def build_report(config: Config, only, measure: str, fetch: bool, fetch_required: bool,
+                 owned_locks=()) -> dict:
     paths = discover_worktrees(config, only)
     self_path = ""
     try:
@@ -1064,7 +1324,10 @@ def build_report(config: Config, only, measure: str, fetch: bool, fetch_required
                 repos.append(repo)
     state = collect_host_state(config, fetch, repos)
 
-    records = [evaluate_worktree(path, config, state, self_path, fetch_required) for path in paths]
+    records = [
+        evaluate_worktree(path, config, state, self_path, fetch_required, owned_locks=owned_locks)
+        for path in paths
+    ]
 
     for record in records:
         if measure == "all" or (measure == "eligible" and record.get("eligible")):
@@ -1085,6 +1348,13 @@ def build_report(config: Config, only, measure: str, fetch: bool, fetch_required
         "host": {
             "unreadable_foreign_pids": len(state.processes.unreadable_foreign_pids),
             "argv_only_own_pids": len(state.processes.restricted),
+            "uncovered_pids": len(state.processes.uncovered_pids),
+            "uncovered_pid_sample": [
+                f"pid {pid}: {state.processes.uncovered_pids[pid]}"
+                for pid in sorted(state.processes.uncovered_pids, key=int)[:5]
+            ],
+            "process_coverage_complete": state.processes.coverage_complete,
+            "privileged_probe": state.processes.probe,
             "process_scan_error": state.processes.error,
             "listener_scan_error": state.listeners.error,
             "unit_scan_error": state.units.error,
@@ -1111,11 +1381,16 @@ def print_report(report: dict, verbose: bool) -> None:
     for key in ("process_scan_error", "listener_scan_error", "unit_scan_error"):
         if host[key]:
             print(f"WARN: {key}: {host[key]}")
-    if host["unreadable_foreign_pids"] or host["argv_only_own_pids"]:
+    if host["privileged_probe"] and host["privileged_probe"] != "not needed":
+        print(f"PROCESS COVERAGE: {host['privileged_probe']}")
+    if not host["process_coverage_complete"]:
         print(
-            f"NOTE: {host['unreadable_foreign_pids']} foreign-uid and "
-            f"{host['argv_only_own_pids']} non-dumpable own processes were matched on argv only"
+            f"WARN: {host['uncovered_pids']} process(es) could not be inspected "
+            f"({host['unreadable_foreign_pids']} foreign-uid, {host['argv_only_own_pids']} "
+            "non-dumpable own). Removal is blocked while their references are unknown."
         )
+        for sample in host["uncovered_pid_sample"]:
+            print(f"      {sample}")
     for repo, result in sorted(report["fetched"].items()):
         print(f"FETCH: {repo}: {'ok' if result['ok'] else 'FAILED: ' + result['error']}")
     print("")
@@ -1190,24 +1465,41 @@ def command_collect(args) -> int:
     failed = []
     state_paths = [record["path"] for record in eligible]
     for path in state_paths:
-        # Re-evaluate immediately before removal so nothing raced the report.
-        fresh = build_report(config, [path], "none", fetch=False, fetch_required=False)
-        record = fresh["worktrees"][0]
-        recheck_blockers = [
-            blocker for blocker in record["blockers"] if blocker["code"] != "remote-refs-not-fetched"
-        ]
-        if recheck_blockers:
-            failed.append((path, "recheck blocked: " + recheck_blockers[0]["code"]))
-            print(f"SKIP {path}: recheck blocked ({recheck_blockers[0]['code']})")
+        # Take the exact agent-task per-worktree flock BEFORE the final
+        # evaluation and keep it until `git worktree remove` has returned. No
+        # agent-task run can start inside that window, which is what closes the
+        # time-of-check/time-of-use race. Failing to take it means someone else
+        # holds it: skip, never force.
+        guard = WorktreeLockGuard(config.root, path)
+        acquired, lock_error = guard.acquire()
+        if not acquired:
+            failed.append((path, f"lock unavailable: {lock_error}"))
+            print(f"SKIP {path}: could not take the worktree lock ({lock_error})")
             continue
-        # Pre-removal tree measurement is an ESTIMATE of what removal should
-        # free. The observed figures below come from statvfs snapshots taken
-        # immediately before and after `git worktree remove`.
-        estimated_inodes, estimated_bytes, _ = measure_tree(path)
-        anchor = snapshot_anchor(path)
-        before, before_error = fs_free_snapshot(anchor)
-        ok, error = remove_worktree(record["main_repo"], path)
-        after, after_error = fs_free_snapshot(anchor) if ok else (None, "")
+        try:
+            # Re-evaluate under the lock so nothing raced the report.
+            fresh = build_report(
+                config, [path], "none", fetch=False, fetch_required=False,
+                owned_locks=guard.lock_files,
+            )
+            record = fresh["worktrees"][0]
+            recheck_blockers = [
+                blocker for blocker in record["blockers"] if blocker["code"] != "remote-refs-not-fetched"
+            ]
+            if recheck_blockers:
+                failed.append((path, "recheck blocked: " + recheck_blockers[0]["code"]))
+                print(f"SKIP {path}: recheck blocked ({recheck_blockers[0]['code']})")
+                continue
+            # Pre-removal tree measurement is an ESTIMATE of what removal should
+            # free. The observed figures below come from statvfs snapshots taken
+            # immediately before and after `git worktree remove`.
+            estimated_inodes, estimated_bytes, _ = measure_tree(path)
+            anchor = snapshot_anchor(path)
+            before, before_error = fs_free_snapshot(anchor)
+            ok, error = remove_worktree(record["main_repo"], path)
+            after, after_error = fs_free_snapshot(anchor) if ok else (None, "")
+        finally:
+            guard.release()
         if not ok:
             failed.append((path, error))
             print(f"FAILED {path}: {error}")
@@ -1385,8 +1677,13 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--worktree", action="append", help="limit to this worktree path (repeatable)")
         sub.add_argument("--measure", choices=("none", "eligible", "all"), default="eligible",
                          help="measure inode/byte usage for: none, eligible worktrees (default), all")
+        sub.add_argument("--approve-task-cleanup", action="append",
+                         help="task whose EXTERNAL state you confirmed completed/cleanup-approved "
+                              "(repeatable); task-associated worktrees are blocked without it")
         sub.add_argument("--strict-process-scan", action="store_true",
-                         help="block every removal while any own process exposes argv only")
+                         help="block every removal whenever any process needed the privileged probe")
+        sub.add_argument("--no-privileged-process-probe", action="store_true",
+                         help="do not attempt the read-only sudo -n probe of uninspectable pids")
         sub.add_argument("--json", action="store_true", help="emit JSON")
         sub.add_argument("--verbose", action="store_true", help="show notes and task details for all worktrees")
 

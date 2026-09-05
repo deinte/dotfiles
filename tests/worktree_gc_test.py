@@ -4,6 +4,8 @@
 Run with: tests/worktree-gc.bash  (or python3 -m unittest tests.worktree_gc_test)
 """
 
+import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -169,6 +171,153 @@ class ProcessScanTest(unittest.TestCase):
         self.assertEqual(gc.restricted_processes_naming(scan, {"/ws/worktrees/y"}), [])
 
 
+class ProcessCoverageTest(unittest.TestCase):
+    """Uninspectable pids must fail closed: absence has to be proven, not assumed."""
+
+    def _foreign_unreadable_proc(self, tmp, pid):
+        """A pid dir with no readable cwd/root/exe links, owned by another uid."""
+        pid_dir = Path(tmp) / str(pid)
+        (pid_dir / "fd").mkdir(parents=True)
+        (pid_dir / "fdinfo").mkdir()
+        (pid_dir / "cmdline").write_bytes(b"root-daemon\0")
+        return pid_dir
+
+    def _scan_as_foreign(self, proc_root):
+        # We cannot chown a fixture to another uid, so make our own uid differ.
+        real_getuid = os.getuid
+        os.getuid = lambda: real_getuid() + 4242
+        try:
+            return gc.scan_processes(str(proc_root))
+        finally:
+            os.getuid = real_getuid
+
+    def test_unreadable_foreign_pid_is_recorded_as_uncovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            proc.mkdir()
+            self._foreign_unreadable_proc(proc, 4242)
+            scan = self._scan_as_foreign(proc)
+            self.assertEqual(scan.error, "")
+            self.assertEqual(scan.unreadable_foreign_pids, ["4242"])
+            self.assertIn("4242", scan.uncovered_pids)
+            self.assertFalse(scan.coverage_complete)
+
+    def test_unreadable_own_pid_is_recorded_as_uncovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            proc.mkdir()
+            self._foreign_unreadable_proc(proc, 77)
+            scan = gc.scan_processes(str(proc))
+            self.assertIn("77", scan.restricted)
+            self.assertIn("77", scan.uncovered_pids)
+            self.assertFalse(scan.coverage_complete)
+
+    def _canned_probe(self, text):
+        return lambda pids: ["printf", "%s", text]
+
+    def _uncovered(self, pid="4242"):
+        return gc.ProcessScan(
+            unreadable_foreign_pids=[pid],
+            uncovered_pids={pid: "foreign-uid pid, /proc links unreadable"},
+        )
+
+    def test_probe_clears_a_pid_and_merges_its_references(self):
+        scan = gc.resolve_process_coverage(
+            self._uncovered(),
+            probe=self._canned_probe(
+                "REF\t4242\tcwd\t0\t/srv/other\n"
+                "REF\t4242\tfd3\t1\t/srv/other/log\n"
+                "PID\t4242\tok\n"
+                "PROBE-OK\n"
+            ),
+        )
+        self.assertTrue(scan.coverage_complete)
+        self.assertEqual(gc.processes_using(scan, {"/ws/worktrees/x"}), [])
+        self.assertTrue(gc.processes_using(scan, {"/srv/other"}))
+
+    def test_probe_that_finds_a_holder_reports_it(self):
+        scan = gc.resolve_process_coverage(
+            self._uncovered(),
+            probe=self._canned_probe(
+                "REF\t4242\tcwd\t0\t/ws/worktrees/x/sub\nPID\t4242\tok\nPROBE-OK\n"
+            ),
+        )
+        self.assertTrue(scan.coverage_complete)
+        self.assertTrue(gc.processes_using(scan, {"/ws/worktrees/x"}))
+
+    def test_exited_pid_counts_as_covered(self):
+        scan = gc.resolve_process_coverage(
+            self._uncovered(), probe=self._canned_probe("PID\t4242\tgone\nPROBE-OK\n")
+        )
+        self.assertTrue(scan.coverage_complete)
+
+    def test_probe_output_without_the_sentinel_clears_nothing(self):
+        """Truncated or forged output must never be read as proof."""
+        scan = gc.resolve_process_coverage(
+            self._uncovered(),
+            probe=self._canned_probe("REF\t4242\tcwd\t0\t/srv/other\nPID\t4242\tok\n"),
+        )
+        self.assertFalse(scan.coverage_complete)
+        self.assertIn("no usable output", scan.probe)
+
+    def test_probe_reporting_a_pid_unreadable_leaves_it_uncovered(self):
+        scan = gc.resolve_process_coverage(
+            self._uncovered(), probe=self._canned_probe("PID\t4242\tunreadable\nPROBE-OK\n")
+        )
+        self.assertFalse(scan.coverage_complete)
+        self.assertIn("4242", scan.uncovered_pids)
+
+    def test_probe_covering_only_some_pids_leaves_the_rest_uncovered(self):
+        scan = gc.ProcessScan(
+            unreadable_foreign_pids=["1", "2"],
+            uncovered_pids={"1": "foreign", "2": "foreign"},
+        )
+        gc.resolve_process_coverage(
+            scan, probe=self._canned_probe("PID\t1\tok\nPROBE-OK\n")
+        )
+        self.assertEqual(set(scan.uncovered_pids), {"2"})
+
+    def test_failed_probe_leaves_coverage_incomplete(self):
+        scan = gc.resolve_process_coverage(
+            self._uncovered(), probe=lambda pids: ["false"]
+        )
+        self.assertFalse(scan.coverage_complete)
+        self.assertIn("privileged probe unavailable", scan.probe)
+
+    def test_disabled_probe_leaves_coverage_incomplete(self):
+        scan = gc.resolve_process_coverage(self._uncovered(), enabled=False)
+        self.assertFalse(scan.coverage_complete)
+        self.assertIn("disabled", scan.probe)
+
+    def test_probe_is_skipped_when_every_pid_was_readable(self):
+        scan = gc.resolve_process_coverage(
+            gc.ProcessScan(), probe=lambda pids: ["false"]
+        )
+        self.assertTrue(scan.coverage_complete)
+        self.assertEqual(scan.probe, "not needed")
+
+    def test_default_probe_is_non_interactive_and_read_only(self):
+        command = gc.default_privileged_probe(["1", "2"])
+        self.assertEqual(command[:3], ["sudo", "-n", "--"])
+        self.assertEqual(command[-2:], ["1", "2"])
+        source = gc.PRIVILEGED_PROBE_SOURCE
+        for forbidden in ("os.remove", "os.kill", "shutil", "subprocess", '"w"', "'w'"):
+            self.assertNotIn(forbidden, source, forbidden)
+
+    def test_probe_source_runs_and_reports_this_process(self):
+        """The probe body is executed for real against our own pid."""
+        proc = subprocess.run(
+            [sys.executable, "-c", gc.PRIVILEGED_PROBE_SOURCE, str(os.getpid()), "999999999"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines[-1], gc.PROBE_SENTINEL)
+        self.assertIn(f"PID\t{os.getpid()}\tok", lines)
+        self.assertIn("PID\t999999999\tgone", lines)
+        self.assertTrue(any(line.startswith(f"REF\t{os.getpid()}\tcwd\t0\t") for line in lines))
+
+
 class ListenerScanTest(unittest.TestCase):
     def test_parses_ss_output(self):
         sample = (
@@ -303,6 +452,104 @@ class LockProbeTest(unittest.TestCase):
             finally:
                 handle.close()
             self.assertFalse(gc.lock_is_held(root, worktree)[0])
+
+
+# A competitor in a *separate process*: flock conflicts are per open file
+# description, so an in-process probe could not tell "we hold it" from
+# "somebody else holds it".
+TRY_LOCK_SOURCE = """
+import fcntl, sys
+handle = open(sys.argv[1], 'a')
+try:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(3)
+sys.exit(0)
+"""
+
+HOLD_LOCK_SOURCE = r"""
+import fcntl, sys
+handle = open(sys.argv[1], 'a')
+fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+sys.stdout.write('LOCKED\n')
+sys.stdout.flush()
+sys.stdin.readline()
+"""
+
+
+def competitor_can_lock(lock_file) -> bool:
+    """True when another process is able to take the agent-task flock right now."""
+    proc = subprocess.run(
+        [sys.executable, "-c", TRY_LOCK_SOURCE, str(lock_file)], capture_output=True
+    )
+    return proc.returncode == 0
+
+
+class WorktreeLockGuardTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        (self.root / "locks").mkdir()
+        self.worktree = str(self.root / "worktrees" / "x")
+
+    def test_lock_files_cover_every_spelling_of_the_path(self):
+        link = self.root / "link"
+        link.symlink_to(self.root / "worktrees", target_is_directory=True)
+        # agent-task hashes the path as spelled, so both spellings must be covered.
+        through_link = str(link / "x")
+        self.assertEqual(
+            {f.name for f in gc.lock_files_for(self.root, through_link)},
+            {
+                hashlib.sha256(through_link.encode()).hexdigest() + ".lock",
+                hashlib.sha256(self.worktree.encode()).hexdigest() + ".lock",
+            },
+        )
+
+    def test_acquire_blocks_other_processes_and_release_frees_them(self):
+        guard = gc.WorktreeLockGuard(self.root, self.worktree)
+        acquired, error = guard.acquire()
+        self.assertTrue(acquired, error)
+        self.assertTrue(guard.held)
+        for lock_file in guard.paths:
+            self.assertFalse(competitor_can_lock(lock_file), lock_file)
+        guard.release()
+        for lock_file in guard.paths:
+            self.assertTrue(competitor_can_lock(lock_file), lock_file)
+
+    def test_acquire_fails_when_a_writer_already_holds_the_lock(self):
+        lock_file = gc.lock_files_for(self.root, self.worktree)[0]
+        holder = open(lock_file, "a")
+        self.addCleanup(holder.close)
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        guard = gc.WorktreeLockGuard(self.root, self.worktree)
+        acquired, error = guard.acquire()
+        self.assertFalse(acquired)
+        self.assertIn("held by another writer", error)
+        self.assertFalse(guard.held)
+        self.assertEqual(guard.lock_files, set())
+
+    def test_a_failed_acquire_releases_whatever_it_already_took(self):
+        link = self.root / "link"
+        link.symlink_to(self.root / "worktrees", target_is_directory=True)
+        spelling = str(link / "x")  # two spellings, so two lock files
+        paths = gc.lock_files_for(self.root, spelling)
+        self.assertEqual(len(paths), 2)
+        holder = open(paths[-1], "a")
+        self.addCleanup(holder.close)
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        guard = gc.WorktreeLockGuard(self.root, spelling)
+        self.assertFalse(guard.acquire()[0])
+        self.assertTrue(competitor_can_lock(paths[0]))
+
+    def test_our_own_lock_is_not_mistaken_for_a_foreign_writer(self):
+        guard = gc.WorktreeLockGuard(self.root, self.worktree)
+        self.assertTrue(guard.acquire()[0])
+        self.addCleanup(guard.release)
+        # Without the ownership hint the same-process guard reads as a holder,
+        # because flock conflicts across open file descriptions.
+        self.assertTrue(gc.lock_is_held(self.root, self.worktree)[0])
+        self.assertEqual(gc.lock_is_held(self.root, self.worktree, owned=guard.lock_files), (False, ""))
 
 
 class GitHelperTest(unittest.TestCase):
@@ -497,16 +744,83 @@ class EndToEndTest(unittest.TestCase):
         (artifacts / "run.json").write_text(json.dumps({"issue": "BUSY", "worktree": str(path)}))
         self.assertIn("task-in-flight", self.blockers(self.report(), "busy"))
 
-    def test_completed_task_does_not_block(self):
-        path = self.fixture.add_worktree("done", "feature/done")
-        artifacts = self.fixture.root / "artifacts" / "DONE"
-        run_dir = artifacts / "runs" / "20260101T000000Z"
-        run_dir.mkdir(parents=True)
-        (run_dir / "result.json").write_text(json.dumps({"state": "COMPLETED"}))
-        (artifacts / "run.json").write_text(json.dumps({"issue": "DONE", "worktree": str(path)}))
+    def _task_worktree(self, name, issue, state="COMPLETED"):
+        """A worktree whose local agent-task run reached `state` (None: no run at all)."""
+        path = self.fixture.add_worktree(name, f"feature/{name}")
+        artifacts = self.fixture.root / "artifacts" / issue
+        artifacts.mkdir(parents=True, exist_ok=True)
+        if state is not None:
+            run_dir = artifacts / "runs" / "20260101T000000Z"
+            run_dir.mkdir(parents=True)
+            (run_dir / "result.json").write_text(json.dumps({"state": state}))
+        (artifacts / "run.json").write_text(json.dumps({"issue": issue, "worktree": str(path)}))
+        return path
+
+    def test_completed_local_run_still_needs_external_cleanup_approval(self):
+        """A terminal LOCAL run says nothing about the external task lifecycle."""
+        self._task_worktree("done", "DONE")
         report = self.report()
-        self.assertEqual(self.blockers(report, "done"), set())
+        self.assertEqual(self.blockers(report, "done"), {"task-cleanup-not-approved"})
         self.assertEqual(self.record(report, "done")["tasks"][0]["issue"], "DONE")
+        self.assertFalse(self.record(report, "done")["tasks"][0]["in_flight"])
+
+    def test_absent_local_run_still_needs_external_cleanup_approval(self):
+        """No local run at all is unknown external state, not permission to delete."""
+        self._task_worktree("norun", "NORUN", state=None)
+        self.assertEqual(self.blockers(self.report(), "norun"), {"task-cleanup-not-approved"})
+
+    def test_every_terminal_local_state_still_blocks_without_approval(self):
+        for index, state in enumerate(sorted(gc.TERMINAL_RUN_STATES)):
+            with self.subTest(state):
+                name = f"term{index}"
+                self._task_worktree(name, f"TERM-{index}", state=state)
+                self.assertIn("task-cleanup-not-approved", self.blockers(self.report(), name))
+
+    def test_external_cleanup_approval_unblocks_a_completed_task(self):
+        self._task_worktree("ok", "OK-1")
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0", "--approve-task-cleanup", "OK-1"
+        )
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.blockers(json.loads(text), "ok"), set())
+
+    def test_external_cleanup_approval_is_slug_matched(self):
+        self._task_worktree("slug", "SPOT-42")
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0", "--approve-task-cleanup", "spot_42"
+        )
+        self.assertEqual(self.blockers(json.loads(text), "slug"), set())
+
+    def test_external_cleanup_approval_does_not_leak_to_other_tasks(self):
+        self._task_worktree("mine", "MINE-1")
+        self._task_worktree("theirs", "THEIRS-1")
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0", "--approve-task-cleanup", "MINE-1"
+        )
+        report = json.loads(text)
+        self.assertEqual(self.blockers(report, "mine"), set())
+        self.assertEqual(self.blockers(report, "theirs"), {"task-cleanup-not-approved"})
+
+    def test_approval_never_overrides_an_in_flight_local_run(self):
+        self._task_worktree("both", "BOTH-1", state="RUNNING")
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0", "--approve-task-cleanup", "BOTH-1"
+        )
+        self.assertEqual(self.blockers(json.loads(text), "both"), {"task-in-flight"})
+
+    def test_approving_a_protected_task_is_a_usage_error(self):
+        code, text = self.run_cli(
+            "inventory", "--protect-task", "SPOT-9", "--approve-task-cleanup", "SPOT-9"
+        )
+        self.assertEqual(code, gc.EXIT_USAGE)
+        self.assertIn("both protected and cleanup-approved", text)
+
+    def test_collect_approve_refuses_a_task_without_external_approval(self):
+        path = self._task_worktree("pending", "PENDING-1")
+        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        self.assertTrue(path.is_dir(), text)
+        self.assertIn("task-cleanup-not-approved", text)
+        self.assertNotIn("REMOVED", text)
 
     def test_protected_task_blocks_by_association_and_by_name(self):
         path = self.fixture.add_worktree("keepme", "feature/keepme")
@@ -588,6 +902,65 @@ class EndToEndTest(unittest.TestCase):
                           "scan_units": gc.UnitScan(error="boom")}[patch]
                 setattr(gc, patch, lambda *a, **k: broken)
                 self.assertIn(code, self.blockers(self.report(), "scanfail"))
+
+    # --- process coverage fails closed ----------------------------------
+
+    def _uninspectable_host(self, probe_output=None):
+        """Pretend one foreign-uid pid cannot be read, with an optional probe result."""
+        gc.scan_processes = lambda *a, **k: gc.ProcessScan(
+            unreadable_foreign_pids=["4242"],
+            uncovered_pids={"4242": "foreign-uid pid, /proc links unreadable"},
+        )
+        saved_probe = gc.default_privileged_probe
+        gc.default_privileged_probe = (
+            (lambda pids: ["printf", "%s", probe_output]) if probe_output
+            else (lambda pids: ["false"])
+        )
+        self.addCleanup(lambda: setattr(gc, "default_privileged_probe", saved_probe))
+
+    def test_uninspectable_pid_blocks_every_worktree(self):
+        self.fixture.add_worktree("clean", "feature/clean")
+        self._uninspectable_host()
+        report = self.report()
+        self.assertIn("process-coverage-incomplete", self.blockers(report, "clean"))
+        self.assertFalse(report["host"]["process_coverage_complete"])
+        self.assertEqual(report["host"]["uncovered_pids"], 1)
+
+    def test_collect_approve_refuses_while_process_coverage_is_incomplete(self):
+        path = self.fixture.add_worktree("clean", "feature/clean")
+        self._uninspectable_host()
+        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        self.assertTrue(path.is_dir(), text)
+        self.assertIn("process-coverage-incomplete", text)
+        self.assertNotIn("REMOVED", text)
+
+    def test_probe_proving_absence_restores_eligibility(self):
+        self.fixture.add_worktree("clean", "feature/clean")
+        self._uninspectable_host("REF\t4242\tcwd\t0\t/srv/elsewhere\nPID\t4242\tok\nPROBE-OK\n")
+        report = self.report()
+        self.assertEqual(self.blockers(report, "clean"), set())
+        self.assertTrue(report["host"]["process_coverage_complete"])
+
+    def test_probe_proving_presence_blocks_as_in_use(self):
+        path = self.fixture.add_worktree("clean", "feature/clean")
+        self._uninspectable_host(f"REF\t4242\tcwd\t0\t{path}\nPID\t4242\tok\nPROBE-OK\n")
+        self.assertIn("in-use-by-process", self.blockers(self.report(), "clean"))
+
+    def test_probe_can_be_turned_off_and_then_everything_blocks(self):
+        self.fixture.add_worktree("clean", "feature/clean")
+        self._uninspectable_host("REF\t4242\tcwd\t0\t/srv/elsewhere\nPID\t4242\tok\nPROBE-OK\n")
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0", "--no-privileged-process-probe"
+        )
+        self.assertIn("process-coverage-incomplete", self.blockers(json.loads(text), "clean"))
+
+    def test_strict_mode_blocks_even_when_the_probe_proved_absence(self):
+        self.fixture.add_worktree("clean", "feature/clean")
+        self._uninspectable_host("REF\t4242\tcwd\t0\t/srv/elsewhere\nPID\t4242\tok\nPROBE-OK\n")
+        code, text = self.run_cli(
+            "inventory", "--json", "--min-age-days", "0", "--strict-process-scan"
+        )
+        self.assertIn("process-scan-incomplete", self.blockers(json.loads(text), "clean"))
 
     def test_worktree_lock_blocks(self):
         import fcntl
@@ -747,6 +1120,90 @@ class EndToEndTest(unittest.TestCase):
         self.assertTrue(path.is_dir(), text)
         self.assertIn("recheck blocked", text)
         self.assertEqual(code, gc.EXIT_FAILURE)
+
+    # --- the removal lock (time-of-check/time-of-use) --------------------
+
+    def test_collect_holds_the_lock_through_measurement_and_removal(self):
+        """The flock is taken before the final check and held until removal returns."""
+        path = self.fixture.add_worktree("clean", "feature/clean")
+        lock_files = gc.lock_files_for(self.fixture.root, str(path))
+        seen = {}
+
+        saved_measure, saved_remove = gc.measure_tree, gc.remove_worktree
+
+        def watched_measure(target):
+            seen["at_measure"] = [competitor_can_lock(f) for f in lock_files]
+            return saved_measure(target)
+
+        def watched_remove(repo, target):
+            seen["before_remove"] = [competitor_can_lock(f) for f in lock_files]
+            result = saved_remove(repo, target)
+            seen["after_remove"] = [competitor_can_lock(f) for f in lock_files]
+            return result
+
+        gc.measure_tree, gc.remove_worktree = watched_measure, watched_remove
+        self.addCleanup(lambda: setattr(gc, "measure_tree", saved_measure))
+        self.addCleanup(lambda: setattr(gc, "remove_worktree", saved_remove))
+
+        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        self.assertEqual(code, 0, text)
+        self.assertFalse(path.exists(), text)
+        # No competing writer could take the lock at any point in the window...
+        self.assertEqual(seen["at_measure"], [False] * len(lock_files))
+        self.assertEqual(seen["before_remove"], [False] * len(lock_files))
+        self.assertEqual(seen["after_remove"], [False] * len(lock_files))
+        # ...and it is released once collect is done.
+        for lock_file in lock_files:
+            self.assertTrue(competitor_can_lock(lock_file), lock_file)
+
+    def test_a_writer_appearing_after_the_plan_stops_the_removal(self):
+        """The exact race the lock closes: agent-task starts between plan and delete."""
+        path = self.fixture.add_worktree("racy", "feature/racy")
+        lock_file = gc.lock_files_for(self.fixture.root, str(path))[0]
+        saved = gc.build_report
+        holders = []
+
+        def planning_then_a_writer_appears(*args, **kwargs):
+            report = saved(*args, **kwargs)
+            if not holders:  # right after the planning report, before the loop
+                child = subprocess.Popen(
+                    [sys.executable, "-c", HOLD_LOCK_SOURCE, str(lock_file)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                )
+                self.assertEqual(child.stdout.readline().strip(), "LOCKED")
+                holders.append(child)
+            return report
+
+        gc.build_report = planning_then_a_writer_appears
+        self.addCleanup(lambda: setattr(gc, "build_report", saved))
+
+        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        for child in holders:
+            child.stdin.close()
+            child.wait(timeout=30)
+            child.stdout.close()
+        self.assertTrue(path.is_dir(), text)
+        self.assertIn("could not take the worktree lock", text)
+        self.assertNotIn("REMOVED", text)
+        self.assertEqual(code, gc.EXIT_FAILURE)
+
+    def test_collect_removes_with_plain_git_worktree_remove(self):
+        path = self.fixture.add_worktree("clean", "feature/clean")
+        saved = gc.git
+        commands = []
+
+        def recording_git(args, **kwargs):
+            commands.append(list(args))
+            return saved(args, **kwargs)
+
+        gc.git = recording_git
+        self.addCleanup(lambda: setattr(gc, "git", saved))
+        code, text = self.run_cli("collect", "--min-age-days", "0", "--approve")
+        self.assertFalse(path.exists(), text)
+        removals = [c for c in commands if "worktree" in c and "remove" in c]
+        self.assertEqual(len(removals), 1, commands)
+        self.assertNotIn("--force", removals[0])
+        self.assertNotIn("-f", removals[0])
 
     def test_collect_requires_fresh_remote_refs(self):
         self.fixture.add_worktree("clean", "feature/clean")
